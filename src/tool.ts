@@ -1,0 +1,266 @@
+import { StringEnum, Type as T } from "@earendil-works/pi-ai";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import * as format from "./format.js";
+import { type DebugConfiguration } from "./launchConfig.js";
+import type { DebugSession, SessionManager, SessionState } from "./session/index.js";
+
+export const DEBUG_TOOL_NAME = "debug";
+
+/**
+ * Register the single `debug` tool. The whole tool logic — translating one call
+ * into L5 method calls and formatting the outcome — lives inline in `execute`.
+ * Invalid usage throws an actionable Error, which Pi surfaces as a failed call.
+ */
+export function registerDebugTool(pi: ExtensionAPI, manager: SessionManager, configurations: DebugConfiguration[] = []): void {
+  const configurationNames = configurations.map((c) => c.name);
+
+  pi.registerTool({
+    name: DEBUG_TOOL_NAME,
+    label: "Debug",
+    description: [
+      "Drive an interactive debugger over the Debug Adapter Protocol (DAP) to launch a program, set breakpoints, step through code, and read live state.",
+      "One call performs one `action`; results print the handles (`sessionId`, `threadId`, `[frameId=N]`, `[ref=N]`) that later calls need — feed them back verbatim.",
+      "Launches come from configurations declared in `.vscode/launch.json` or `.pi/launch.json`; use action `start` with a configuration `name` to run one.",
+      "Typical loop: `start` → `set_breakpoints` → `continue` → inspect with `stack_trace` / `scopes` / `variables` / `evaluate` → `step_over` / `step_in` / `step_out` / `continue` → `stop`.",
+      "Inspection actions (`stack_trace`, `scopes`, `variables`, `evaluate`, stepping, `pause`) require the session to be stopped; check the `action` enum for per-action rules.",
+    ].join("\n"),
+    promptSnippet: "Debug a program interactively via DAP: launch, breakpoints, stepping, and reading live variables and expressions at a stop.",
+    promptGuidelines: [
+      "Use `debug` to diagnose runtime behaviour (crashes, wrong output, hangs, unclear control flow) by observing real values at a breakpoint, instead of guessing from source or adding print statements.",
+      "Prefer `debug` over running the program with `bash` whenever you need to pause execution, inspect variables, or step through logic; keep `bash` for pure build, test, or run-and-read-output tasks.",
+      "Do not modify program code through `debug` — its `evaluate` and `variables` actions are for reading live state; use `edit` or `write` to change source, then re-run `debug` to verify the fix.",
+      "After each `debug` result, reuse the printed `[frameId=N]` and `[ref=N]` handles for follow-up `scopes` / `variables` / `evaluate` calls; do not invent numeric ids.",
+      "Always end a `debug` investigation with action `stop` (or terminate/disconnect) so the debuggee and adapter process are cleaned up.",
+    ],
+    parameters: T.Object({
+      action: StringEnum(
+        [
+          "start",
+          "set_breakpoints",
+          "continue",
+          "step_over",
+          "step_in",
+          "step_out",
+          "pause",
+          "threads",
+          "stack_trace",
+          "scopes",
+          "variables",
+          "evaluate",
+          "output",
+          "list_sessions",
+          "switch_session",
+          "stop",
+        ] as const,
+        {
+          description:
+            "The debug operation to perform. Lifecycle: 'start' launches a program from a launch configuration; 'stop' ends a session. Breakpoints: 'set_breakpoints' declares where to pause. Execution (only while stopped): 'continue' resumes, 'step_over'/'step_in'/'step_out' step one line, 'pause' interrupts a running program; each returns where and why it stopped next. Inspection (only while stopped): 'threads' lists threads, 'stack_trace' lists call frames, 'scopes' lists a frame's scopes, 'variables' expands a variable container, 'evaluate' evaluates an expression, 'output' returns recent program output. Sessions: 'list_sessions' lists all debug sessions, 'switch_session' switches the active session.",
+        },
+      ),
+      sessionId: T.Optional(
+        T.String({
+          description:
+            "Which debug session to act on. Omit to use the active session (the one most recently started or selected). Obtain ids from action 'list_sessions'. Only needed when juggling more than one session at once.",
+        }),
+      ),
+      name: StringEnum(configurationNames, {
+        description:
+          "For 'start': the name of the launch configuration to run, as defined in .vscode/launch.json or .pi/launch.json. Omit to use the first configuration found.",
+      }),
+      path: T.Optional(
+        T.String({
+          description: "For 'set_breakpoints': the source file to put breakpoints in, as a workspace-relative or absolute path.",
+        }),
+      ),
+      lines: T.Optional(
+        T.Array(T.Integer({ minimum: 1 }), {
+          description:
+            "For 'set_breakpoints': the 1-based line numbers to break on. This replaces ALL breakpoints previously set in that file; pass an empty array to clear them.",
+        }),
+      ),
+      threadId: T.Optional(
+        T.Integer({
+          description:
+            "For 'continue'/'step_over'/'step_in'/'step_out'/'pause': the thread to act on. Omit to use the thread that last stopped (the common case). Obtain thread ids from action 'threads'.",
+        }),
+      ),
+      frameId: T.Optional(
+        T.Integer({
+          description:
+            "For 'scopes' (required) and 'evaluate' (optional): the stack frame to inspect or evaluate in. Use a frameId printed as '[frameId=N]' in a previous 'stack_trace' or stop result. For 'evaluate', omit to use the top frame.",
+        }),
+      ),
+      levels: T.Optional(
+        T.Integer({
+          minimum: 1,
+          description: "For 'stack_trace': the maximum number of call frames to return, counting from the top of the stack. Omit for the default limit.",
+        }),
+      ),
+      variablesReference: T.Optional(
+        T.Integer({
+          description:
+            "For 'variables': the container to expand. Use a reference printed as '[ref=N]' next to a scope (from 'scopes') or an expandable variable (from a previous 'variables'/'evaluate').",
+        }),
+      ),
+      expression: T.Optional(
+        T.String({
+          description:
+            "For 'evaluate': the expression to evaluate, written in the language of the program being debugged. It is evaluated in the frame given by frameId, or the top frame if none is given.",
+        }),
+      ),
+    }),
+    executionMode: "sequential",
+
+    async execute(_toolCallId, args, _signal) {
+      const ok = (text: string, details: unknown) => ({ content: [{ type: "text" as const, text }], details });
+
+      switch (args.action) {
+        case "start": {
+          const config = pickConfiguration(configurations, args.name);
+          const session = await manager.createSession(config);
+          await session.configureAndStart();
+          const summaryText = format.formatSessionSummary(session);
+          const stop = session.getStopState();
+          const text = stop ? `${summaryText}\n${format.formatStop(stop, session.id)}` : summaryText;
+          return ok(text, summarize(session));
+        }
+
+        case "set_breakpoints": {
+          const session = activeSession(manager, args.sessionId);
+          const path = required(args.path, "path", args.action);
+          const lines = required(args.lines, "lines", args.action);
+          const breakpoints = await session.setBreakpoints({ path, breakpoints: lines.map((line) => ({ line })) });
+          return ok(format.formatBreakpoints(path, breakpoints), breakpoints);
+        }
+
+        case "continue": {
+          const session = activeSession(manager, args.sessionId);
+          const outcome = await session.continueAndWait(args.threadId);
+          return ok(format.formatResume(outcome, session.id), outcome);
+        }
+
+        case "step_over":
+        case "step_in":
+        case "step_out": {
+          const session = activeSession(manager, args.sessionId);
+          const threadId = required(args.threadId ?? session.getStopState()?.threadId, "threadId", args.action);
+          const method = ({ step_over: "stepOver", step_in: "stepIn", step_out: "stepOut" } as const)[args.action];
+          const outcome = await session[method](threadId);
+          return ok(format.formatResume(outcome, session.id), outcome);
+        }
+
+        case "pause": {
+          const session = activeSession(manager, args.sessionId);
+          const threadId = required(args.threadId ?? session.getStopState()?.threadId, "threadId", args.action);
+          const snapshot = await session.pause(threadId);
+          return ok(format.formatStop(snapshot, session.id), snapshot);
+        }
+
+        case "threads": {
+          const session = activeSession(manager, args.sessionId);
+          const threads = await session.listThreads();
+          return ok(format.formatThreads(threads, session.getStopState()?.threadId), threads);
+        }
+
+        case "stack_trace": {
+          const session = activeSession(manager, args.sessionId);
+          const threadId = required(args.threadId ?? session.getStopState()?.threadId, "threadId", args.action);
+          const frames = await session.getStackTrace(threadId, args.levels ? { levels: args.levels } : {});
+          return ok(format.formatStack(frames), frames);
+        }
+
+        case "scopes": {
+          const session = activeSession(manager, args.sessionId);
+          const frameId = required(args.frameId, "frameId", args.action);
+          const scopes = await session.getScopes(frameId);
+          return ok(format.formatScopes(scopes), scopes);
+        }
+
+        case "variables": {
+          const session = activeSession(manager, args.sessionId);
+          const ref = required(args.variablesReference, "variablesReference", args.action);
+          const variables = await session.getVariables(ref);
+          return ok(format.formatVariables(variables), variables);
+        }
+
+        case "evaluate": {
+          const session = activeSession(manager, args.sessionId);
+          const expression = required(args.expression, "expression", args.action);
+          const body = await session.evaluate(expression, args.frameId);
+          return ok(body ? format.formatEvaluate(body) : "=> (no result)", body);
+        }
+
+        case "output": {
+          const session = activeSession(manager, args.sessionId);
+          const events = session.getRecentOutput();
+          return ok(format.formatOutput(events), events);
+        }
+
+        case "list_sessions":
+          return ok(format.formatSessions(manager.list(), manager.active?.id), manager.list().map(summarize));
+
+        case "switch_session": {
+          const id = required(args.sessionId, "sessionId", args.action);
+          manager.setActive(id);
+          const session = activeSession(manager, id);
+          return ok(format.formatSessionSummary(session), summarize(session));
+        }
+
+        case "stop": {
+          const session = activeSession(manager, args.sessionId);
+          await session.terminate();
+          return ok(format.formatTerminated(session.id, session.state), summarize(session));
+        }
+      }
+    },
+  });
+}
+
+function pickConfiguration(configurations: DebugConfiguration[], name?: string): DebugConfiguration {
+  if (configurations.length === 0) {
+    throw new Error("No debug configurations found in .vscode/launch.json or .pi/launch.json");
+  }
+  if (name === undefined) {
+    return configurations[0]!;
+  }
+  const match = configurations.find((config) => config.name === name);
+  if (!match) {
+    const names = configurations.map((config) => config.name ?? "(unnamed)").join(", ");
+    throw new Error(`No debug configuration named "${name}". Available: ${names}`);
+  }
+  return match;
+}
+
+/** Resolve the target session: an explicit id, or the active session. */
+function activeSession(manager: SessionManager, sessionId?: string): DebugSession {
+  if (sessionId !== undefined) {
+    const session = manager.get(sessionId);
+    if (!session) {
+      throw new Error(`No session "${sessionId}". Use action "list_sessions" to list them.`);
+    }
+    return session;
+  }
+  const session = manager.active;
+  if (!session) {
+    throw new Error('No active debug session. Use action "start" first.');
+  }
+  return session;
+}
+
+function required<T>(value: T | undefined, name: string, action: string): T {
+  if (value === undefined) {
+    throw new Error(`action "${action}" requires "${name}"`);
+  }
+  return value;
+}
+
+interface DebugSessionSummary {
+  id: string;
+  state: SessionState;
+  parentId?: string;
+  configuration: DebugConfiguration;
+}
+
+function summarize(session: DebugSession): DebugSessionSummary {
+  return { id: session.id, state: session.state, parentId: session.parentId, configuration: session.configuration };
+}
