@@ -1,0 +1,51 @@
+{
+  "name": "pi-debug",
+  "version": "0.1.0",
+  "description": "Pi extension that lets the Pi Agent debug programs over the VS Code Debug Adapter Protocol (DAP).",
+  "keywords": [
+    "pi-package"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/saltfishpr/pi-debug.git"
+  },
+  "author": "saltfishpr",
+  "license": "MIT",
+  "homepage": "https://github.com/saltfishpr/pi-debug#readme",
+  "bugs": {
+    "url": "https://github.com/saltfishpr/pi-debug/issues"
+  },
+  "files": [
+    "src",
+    "README.md",
+    "README.zh.md",
+    "LICENSE"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@vscode/debugprotocol": "^1.68.0",
+    "jsonc-parser": "^3.3.1",
+    "zod": "^4.5.4"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "^0.85.1",
+    "@earendil-works/pi-coding-agent": "^0.85.1",
+    "@earendil-works/pi-tui": "^0.85.1",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.6.0",
+    "vitest": "^4.1.10"
+  }
+}
