@@ -5,8 +5,16 @@ import type { Transport } from "../transport/transport";
 import { DapConnectionError, DapResponseError, DapTimeoutError } from "../util/errors";
 import type { Logger } from "../util/logger";
 import { noopLogger } from "../util/logger";
-import type { Disposable } from "../util/typedEmitter";
-import type { EventBodyMap, EventName, RequestArgs, RequestCommand, ResponseBody, ReverseRequestCommand, ReverseRequestTypeMap } from "./protocolMaps";
+import type { RequestArgs, RequestCommand, ResponseBody, ReverseRequestCommand, ReverseRequestTypeMap } from "./protocolMaps";
+
+/** Protocol messages and connection notifications emitted by a client. */
+export type DapClientEvents = {
+  event: [event: DebugProtocol.Event];
+  close: [];
+  /** Register a listener before start(); unhandled errors throw as in Node. */
+  error: [error: Error];
+  stderr: [chunk: Buffer];
+};
 
 export interface DapClientOptions {
   logger?: Logger;
@@ -32,27 +40,20 @@ interface PendingRequest {
   timer?: NodeJS.Timeout;
 }
 
-const EVENT_PREFIX = "dap:event:";
-const ANY_EVENT = "dap:anyEvent";
-const LIFECYCLE_CLOSE = "dap:close";
-const LIFECYCLE_ERROR = "dap:error";
-const LIFECYCLE_STDERR = "dap:stderr";
-
 /**
  * The request/response and event-dispatch layer of the DAP stack.
  *
  * Responsibilities, mirroring nvim-dap's `session:request` / `handle_body`:
  *  - assign monotonically increasing sequence numbers to outgoing messages;
  *  - correlate responses back to their originating request via `request_seq`;
- *  - dispatch adapter events to typed listeners;
+ *  - forward adapter events without interpreting debugging semantics;
  *  - route reverse requests (`runInTerminal`, `startDebugging`) to handlers and
  *    reply with a well-formed response.
  *
  * It is intentionally stateless with respect to debugging semantics (threads,
  * breakpoints, ...); that lives in {@link Session}.
  */
-export class DapClient {
-  private readonly emitter = new EventEmitter();
+export class DapClient extends EventEmitter<DapClientEvents> {
   private readonly parser = new MessageParser();
   private readonly pending = new Map<number, PendingRequest>();
   private readonly reverseHandlers = new Map<string, ReverseRequestHandler<ReverseRequestCommand>>();
@@ -67,22 +68,30 @@ export class DapClient {
     private readonly transport: Transport,
     options: DapClientOptions = {},
   ) {
+    super();
     this.logger = options.logger ?? noopLogger;
     this.defaultTimeoutMs = options.requestTimeoutMs ?? 0;
-    this.emitter.setMaxListeners(200);
   }
 
-  /** Connect the transport and begin reading messages. Idempotent. */
+  /** Connect and begin reading messages. Register an error listener first. Idempotent. */
   async start(): Promise<void> {
     if (this.started) {
       return;
     }
     this.started = true;
 
-    this.transport.on("data", (chunk) => this.handleData(chunk));
-    this.transport.on("stderr", (chunk) => this.emitter.emit(LIFECYCLE_STDERR, chunk));
-    this.transport.on("error", (err) => this.emitter.emit(LIFECYCLE_ERROR, err));
-    this.transport.on("close", () => this.handleClose());
+    this.transport.on("error", (err) => {
+      if (!this.disposed) this.emit("error", err);
+    });
+    this.transport.on("data", (chunk) => {
+      if (!this.disposed) this.handleData(chunk);
+    });
+    this.transport.on("close", () => {
+      if (!this.disposed) this.handleClose();
+    });
+    this.transport.on("stderr", (chunk) => {
+      if (!this.disposed) this.emit("stderr", chunk);
+    });
 
     await this.transport.connect();
   }
@@ -131,33 +140,6 @@ export class DapClient {
     });
   }
 
-  // ---- events -------------------------------------------------------------
-
-  /** Subscribe to a specific DAP event by name. */
-  onEvent<K extends EventName>(event: K, listener: (body: EventBodyMap[K], raw: DebugProtocol.Event) => void): Disposable {
-    return this.subscribe(`${EVENT_PREFIX}${event}`, listener as (...args: unknown[]) => void);
-  }
-
-  /** Subscribe to every DAP event, regardless of name. */
-  onAnyEvent(listener: (event: DebugProtocol.Event) => void): Disposable {
-    return this.subscribe(ANY_EVENT, listener as (...args: unknown[]) => void);
-  }
-
-  /** Fired once when the underlying transport closes. */
-  onClose(listener: () => void): Disposable {
-    return this.subscribe(LIFECYCLE_CLOSE, listener);
-  }
-
-  /** Fired on transport-level errors. */
-  onError(listener: (error: Error) => void): Disposable {
-    return this.subscribe(LIFECYCLE_ERROR, listener as (...args: unknown[]) => void);
-  }
-
-  /** Diagnostic output written by the adapter to stderr (executable adapters). */
-  onStderr(listener: (chunk: Buffer) => void): Disposable {
-    return this.subscribe(LIFECYCLE_STDERR, listener as (...args: unknown[]) => void);
-  }
-
   // ---- reverse requests ---------------------------------------------------
 
   /** Register a handler for an adapter→client request. */
@@ -176,6 +158,7 @@ export class DapClient {
       return;
     }
     this.disposed = true;
+
     for (const pending of this.pending.values()) {
       clearTimeout(pending.timer);
       pending.reject(new DapConnectionError(`Client disposed before '${pending.command}' completed`));
@@ -183,7 +166,7 @@ export class DapClient {
     this.pending.clear();
     this.transport.dispose();
     this.parser.reset();
-    this.emitter.removeAllListeners();
+    this.removeAllListeners();
   }
 
   get isDisposed(): boolean {
@@ -196,18 +179,13 @@ export class DapClient {
     return this.sequence++;
   }
 
-  private subscribe(event: string, listener: (...args: unknown[]) => void): Disposable {
-    this.emitter.on(event, listener);
-    return { dispose: () => this.emitter.off(event, listener) };
-  }
-
   private handleData(chunk: Buffer): void {
     let messages: DebugProtocol.ProtocolMessage[];
     try {
       messages = this.parser.append(chunk);
     } catch (err) {
       this.logger.error("Failed to parse adapter message", err);
-      this.emitter.emit(LIFECYCLE_ERROR, err instanceof Error ? err : new Error(String(err)));
+      this.emit("error", err instanceof Error ? err : new Error(String(err)));
       return;
     }
     for (const message of messages) {
@@ -249,8 +227,7 @@ export class DapClient {
 
   private handleEvent(event: DebugProtocol.Event): void {
     this.logger.debug("← event", event.event);
-    this.emitter.emit(`${EVENT_PREFIX}${event.event}`, event.body, event);
-    this.emitter.emit(ANY_EVENT, event);
+    this.emit("event", event);
   }
 
   private async handleReverseRequest(request: DebugProtocol.Request): Promise<void> {
@@ -301,6 +278,6 @@ export class DapClient {
       pending.reject(new DapConnectionError(`Connection closed before '${pending.command}' completed`));
     }
     this.pending.clear();
-    this.emitter.emit(LIFECYCLE_CLOSE);
+    this.emit("close");
   }
 }

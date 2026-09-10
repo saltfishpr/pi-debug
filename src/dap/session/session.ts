@@ -1,14 +1,43 @@
 import type { DebugProtocol } from "@vscode/debugprotocol";
+import { EventEmitter } from "node:events";
 import type { DapClient, RequestOptions } from "../client/dapClient";
-import type { RequestArgs, RequestCommand, ResponseBody } from "../client/protocolMaps";
+import type { EventBodyMap, RequestArgs, RequestCommand, ResponseBody } from "../client/protocolMaps";
 import { Deferred } from "../util/deferred";
 import type { Logger } from "../util/logger";
 import { noopLogger } from "../util/logger";
-import type { Disposable } from "../util/typedEmitter";
-import { TypedEventEmitter } from "../util/typedEmitter";
-import { SessionState, type DebugConfiguration, type SessionEvents, type SessionStartOptions, type ThreadInfo } from "./types";
+import { SessionState, type DebugConfiguration, type SessionStartOptions, type ThreadInfo } from "./types";
 
 let nextSessionId = 1;
+
+/** The set of typed events a {@link Session} emits to its consumers. */
+export type SessionEvents = {
+  /** Fired whenever {@link SessionState} transitions. */
+  stateChanged: [SessionState, SessionState];
+  /** Adapter is ready to receive configuration (breakpoints, etc.). */
+  initialized: [];
+  /** Debuggee (or a thread) stopped. */
+  stopped: [DebugProtocol.StoppedEvent["body"]];
+  /** Execution resumed. */
+  continued: [DebugProtocol.ContinuedEvent["body"]];
+  /** A thread started or exited. */
+  thread: [DebugProtocol.ThreadEvent["body"]];
+  /** Debuggee produced output. */
+  output: [DebugProtocol.OutputEvent["body"]];
+  /** A breakpoint's state changed (verified, moved, removed, ...). */
+  breakpoint: [DebugProtocol.BreakpointEvent["body"]];
+  /** Adapter reported additional/changed capabilities. */
+  capabilities: [DebugProtocol.Capabilities];
+  /** Debuggee exited with an exit code. */
+  exited: [DebugProtocol.ExitedEvent["body"]];
+  /** The debug session terminated. */
+  terminated: [DebugProtocol.TerminatedEvent["body"] | undefined];
+  /** Any DAP event, including ones without a dedicated typed channel. */
+  event: [DebugProtocol.Event];
+  /** The session closed (transport gone / disposed). */
+  close: [];
+  /** A terminal session failure; emitted after the session has closed. */
+  sessionError: [Error];
+};
 
 /**
  * A single debug session: one connection to one adapter, driving one debuggee.
@@ -23,7 +52,7 @@ let nextSessionId = 1;
  * Parent/child relationships (from `startDebugging` reverse requests) are
  * tracked here and wired up by the {@link SessionManager}.
  */
-export class Session extends TypedEventEmitter<SessionEvents> {
+export class Session extends EventEmitter<SessionEvents> {
   readonly id: string;
   parent?: Session;
   readonly children = new Map<string, Session>();
@@ -35,13 +64,14 @@ export class Session extends TypedEventEmitter<SessionEvents> {
   private _focusedFrameId?: number;
 
   private readonly logger: Logger;
-  private readonly disposables: Disposable[] = [];
-  private readonly options: SessionStartOptions;
+  private readonly cleanups: Array<() => void> = [];
+  private readonly startOptions: SessionStartOptions;
 
   private readonly sourceBreakpoints = new Map<string, DebugProtocol.SourceBreakpoint[]>();
   private functionBreakpoints: DebugProtocol.FunctionBreakpoint[] = [];
 
   private started = false;
+  private failure?: Error; // The first error that occurred in the session.
   private threadsDirty = true;
   private initializePromise?: Promise<DebugProtocol.Capabilities>;
   private readonly configured = new Deferred<void>();
@@ -49,21 +79,22 @@ export class Session extends TypedEventEmitter<SessionEvents> {
   constructor(
     readonly client: DapClient,
     readonly config: DebugConfiguration,
-    options: SessionStartOptions & { logger?: Logger; id?: string } = {},
+    startOptions: SessionStartOptions = {},
+    options: { logger?: Logger; id?: string } = {},
   ) {
     super();
     this.id = options.id ?? `session-${nextSessionId++}`;
     this.logger = options.logger ?? noopLogger;
-    this.options = {
+    this.startOptions = {
       autoFetchStackTraceOnStop: true,
       configureTimeoutMs: 8000,
-      ...options,
+      ...startOptions,
     };
 
-    for (const [path, bps] of Object.entries(options.breakpoints ?? {})) {
+    for (const [path, bps] of Object.entries(startOptions.breakpoints ?? {})) {
       this.sourceBreakpoints.set(path, bps);
     }
-    this.functionBreakpoints = options.functionBreakpoints ?? [];
+    this.functionBreakpoints = startOptions.functionBreakpoints ?? [];
 
     this.registerClientListeners();
   }
@@ -121,9 +152,8 @@ export class Session extends TypedEventEmitter<SessionEvents> {
 
     // Fire launch/attach; the adapter answers the `initialized` event
     // asynchronously, which drives configuration.
-    const launchPromise = this.client.sendRequest(this.config.request, this.config as unknown as RequestArgs<"launch">).catch((err: Error) => {
-      this.logger.error(`${this.config.request} failed`, err.message);
-      this.emit("error", err);
+    const launchPromise = this.client.sendRequest(this.config.request, this.config as RequestArgs<"launch" | "attach">).catch((err: Error) => {
+      this.handleSessionError(new Error(`${this.config.request} failed`, { cause: err }));
       throw err;
     });
 
@@ -157,10 +187,10 @@ export class Session extends TypedEventEmitter<SessionEvents> {
       return;
     }
     this.setState(SessionState.Terminated);
-    for (const disposable of this.disposables) {
-      disposable.dispose();
+    for (const cleanup of this.cleanups) {
+      cleanup();
     }
-    this.disposables.length = 0;
+    this.cleanups.length = 0;
     this.client.dispose();
     if (this.parent) {
       this.parent.children.delete(this.id);
@@ -306,8 +336,8 @@ export class Session extends TypedEventEmitter<SessionEvents> {
       if (this.functionBreakpoints.length > 0 && this._capabilities.supportsFunctionBreakpoints) {
         await this.client.sendRequest("setFunctionBreakpoints", { breakpoints: this.functionBreakpoints });
       }
-      if (this.options.exceptionFilters) {
-        await this.setExceptionBreakpoints(this.options.exceptionFilters);
+      if (this.startOptions.exceptionFilters) {
+        await this.setExceptionBreakpoints(this.startOptions.exceptionFilters);
       }
       if (this._capabilities.supportsConfigurationDoneRequest) {
         await this.client.sendRequest("configurationDone", undefined);
@@ -328,7 +358,7 @@ export class Session extends TypedEventEmitter<SessionEvents> {
   }
 
   private async waitForConfigured(): Promise<void> {
-    const timeoutMs = this.options.configureTimeoutMs ?? 8000;
+    const timeoutMs = this.startOptions.configureTimeoutMs ?? 8000;
     if (timeoutMs <= 0) {
       return this.configured.promise;
     }
@@ -352,28 +382,62 @@ export class Session extends TypedEventEmitter<SessionEvents> {
   // ---- event wiring -------------------------------------------------------
 
   private registerClientListeners(): void {
-    this.disposables.push(
-      this.client.onEvent("initialized", () => {
-        this.emit("initialized");
-        void this.configure().catch((err: Error) => {
-          this.logger.error("Configuration failed", err.message);
-          this.emit("error", err);
-        });
-      }),
-      this.client.onEvent("stopped", (body) => this.onStopped(body)),
-      this.client.onEvent("continued", (body) => this.onContinued(body)),
-      this.client.onEvent("thread", (body) => this.onThread(body)),
-      this.client.onEvent("output", (body) => this.emit("output", body)),
-      this.client.onEvent("breakpoint", (body) => this.emit("breakpoint", body)),
-      this.client.onEvent("capabilities", (body) => {
-        this.mergeCapabilities(body.capabilities);
-      }),
-      this.client.onEvent("exited", (body) => this.emit("exited", body)),
-      this.client.onEvent("terminated", (body) => this.onTerminated(body)),
-      this.client.onAnyEvent((event) => this.emit("event", event)),
-      this.client.onClose(() => this.close()),
-      this.client.onError((err) => this.emit("error", err)),
+    const onError = (error: Error) => this.handleSessionError(error);
+    const onEvent = (event: DebugProtocol.Event) => this.handleClientEvent(event);
+    const onClose = () => this.close();
+    this.client.on("error", onError);
+    this.client.on("event", onEvent);
+    this.client.on("close", onClose);
+    this.cleanups.push(
+      () => this.client.off("event", onEvent),
+      () => this.client.off("close", onClose),
+      () => this.client.off("error", onError),
     );
+  }
+
+  private handleSessionError(error: Error): void {
+    if (this.failure || (this._state === SessionState.Terminated && this.client.isDisposed)) {
+      return;
+    }
+    this.failure = error;
+    this.logger.error(error.message);
+    this.close();
+    this.emit("sessionError", error);
+  }
+
+  private handleClientEvent(event: DebugProtocol.Event): void {
+    // Protocol bodies are trusted here; EventBodyMap does not validate wire data.
+    switch (event.event) {
+      case "initialized":
+        this.emit("initialized");
+        void this.configure().catch((err: Error) => this.handleSessionError(err));
+        break;
+      case "stopped":
+        this.onStopped(event.body as EventBodyMap["stopped"]);
+        break;
+      case "continued":
+        this.onContinued(event.body as EventBodyMap["continued"]);
+        break;
+      case "thread":
+        this.onThread(event.body as EventBodyMap["thread"]);
+        break;
+      case "output":
+        this.emit("output", event.body as EventBodyMap["output"]);
+        break;
+      case "breakpoint":
+        this.emit("breakpoint", event.body as EventBodyMap["breakpoint"]);
+        break;
+      case "capabilities":
+        this.mergeCapabilities((event.body as EventBodyMap["capabilities"]).capabilities);
+        break;
+      case "exited":
+        this.emit("exited", event.body as EventBodyMap["exited"]);
+        break;
+      case "terminated":
+        this.onTerminated(event.body as EventBodyMap["terminated"]);
+        break;
+    }
+    this.emit("event", event);
   }
 
   private onStopped(body: DebugProtocol.StoppedEvent["body"]): void {
@@ -396,7 +460,7 @@ export class Session extends TypedEventEmitter<SessionEvents> {
 
     this.emit("stopped", body);
 
-    if (this.options.autoFetchStackTraceOnStop && typeof body.threadId === "number") {
+    if (this.startOptions.autoFetchStackTraceOnStop && typeof body.threadId === "number") {
       void this.hydrateStoppedThread(body.threadId);
     }
   }
@@ -513,7 +577,7 @@ export class Session extends TypedEventEmitter<SessionEvents> {
       supportsRunInTerminalRequest: true,
       supportsProgressReporting: true,
       supportsStartDebuggingRequest: true,
-      ...this.options.initializeArgs,
+      ...this.startOptions.initializeArgs,
     };
   }
 

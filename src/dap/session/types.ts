@@ -37,36 +37,6 @@ export interface ThreadInfo {
   frames?: DebugProtocol.StackFrame[];
 }
 
-/** The set of typed events a {@link Session} emits to its consumers. */
-export type SessionEvents = {
-  /** Fired whenever {@link SessionState} transitions. */
-  stateChanged: [SessionState, SessionState];
-  /** Adapter is ready to receive configuration (breakpoints, etc.). */
-  initialized: [];
-  /** Debuggee (or a thread) stopped. */
-  stopped: [DebugProtocol.StoppedEvent["body"]];
-  /** Execution resumed. */
-  continued: [DebugProtocol.ContinuedEvent["body"]];
-  /** A thread started or exited. */
-  thread: [DebugProtocol.ThreadEvent["body"]];
-  /** Debuggee produced output. */
-  output: [DebugProtocol.OutputEvent["body"]];
-  /** A breakpoint's state changed (verified, moved, removed, ...). */
-  breakpoint: [DebugProtocol.BreakpointEvent["body"]];
-  /** Adapter reported additional/changed capabilities. */
-  capabilities: [DebugProtocol.Capabilities];
-  /** Debuggee exited with an exit code. */
-  exited: [DebugProtocol.ExitedEvent["body"]];
-  /** The debug session terminated. */
-  terminated: [DebugProtocol.TerminatedEvent["body"] | undefined];
-  /** Any DAP event, including ones without a dedicated typed channel. */
-  event: [DebugProtocol.Event];
-  /** The session closed (transport gone / disposed). */
-  close: [];
-  /** A non-fatal error occurred within the session. */
-  error: [Error];
-};
-
 /** Options controlling {@link Session} behaviour. */
 export interface SessionStartOptions {
   /** Arguments merged onto the default `initialize` request arguments. */

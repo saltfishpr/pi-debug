@@ -17,19 +17,20 @@ Data flows **down** for requests and **up** for adapter messages. Keep the layer
 | `DapClient`      | `src/dap/client/dapClient.ts`, `src/dap/client/protocolMaps.ts` | seq numbers, request/response correlation, event dispatch, reverse-request handling                                                                           |
 | `Transport`      | `src/dap/transport/*.ts`                                        | raw bytes only: stdio / TCP / server-executable                                                                                                               |
 | codec            | `src/dap/protocol/messageCodec.ts`                              | `Content-Length` framing (`MessageParser`, `encodeMessage`)                                                                                                   |
-| utils            | `src/dap/util/*.ts`                                             | `TypedEventEmitter`, `Deferred`, `Logger`, error classes                                                                                                      |
+| utils            | `src/dap/util/*.ts`                                             | `Deferred`, `Logger`, error classes                                                                                                                           |
 
 Public API surface is curated in `src/dap/index.ts` (KISS — only key APIs). Internals are reachable via subpaths but are intentionally kept out of the barrel.
 
 ## How to extend
 
 - **New DAP request/response:** add to `RequestTypeMap`, then (if it's part of the high-level API) add a typed convenience method on `Session`. Custom/vendor commands can go through `session.request(command, args)` / `client.sendRequest(command, args)` without a map entry (falls back to `unknown`).
-- **New transport:** subclass `Transport` (implement `connect`/`write`/`dispose`, fire `data`/`stderr`/`close`/`error`), extend the `AdapterDefinition` union in `src/dap/transport/adapter.ts`, and wire it in `createTransport`.
-- **New session event:** add to `SessionEvents` in `src/dap/session/types.ts`, subscribe in `Session.registerClientListeners`, and re-emit.
+- **New transport:** subclass `Transport` (implement `connect`/`write`/`dispose`, emit `data`/`stderr`/`close`/`error`), extend the `AdapterDefinition` union in `src/dap/transport/adapter.ts`, and wire it in `createTransport`. Callers must subscribe to its Node `error` event before `connect`.
+- **New session event:** add to `SessionEvents` in `src/dap/session/session.ts`, handle the protocol event in `Session.handleClientEvent`, and re-emit.
 
 ## Gotchas
 
 - The `initialized` **event** (adapter → client) triggers configuration; do not confuse it with the `initialize` **request**. Configuration (`setBreakpoints`, `setExceptionBreakpoints`, `configurationDone`) happens on that event, gated by capabilities.
 - Sequence numbers are shared across outgoing requests and reverse-request responses; only `DapClient` assigns them.
 - Buffer typing: keep `MessageParser.rawData` annotated as `Buffer` (Node's generic `Buffer` typing otherwise causes `ArrayBufferLike` mismatches).
+- `Session`, `SessionManager`, `DapClient`, and `Transport` use Node's typed `EventEmitter`. Reserve its special `error` event for terminal low-level failures; expose session-level failures as `sessionError` after closing the session.
 - `tsconfig` targets ES2022 (needed for `Error` `cause`); keep it there.

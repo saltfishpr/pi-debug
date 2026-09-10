@@ -1,5 +1,5 @@
 export { DapClient } from "./dapClient";
-export type { DapClientOptions, RequestOptions, ReverseRequestHandler } from "./dapClient";
+export type { DapClientEvents, DapClientOptions, RequestOptions, ReverseRequestHandler } from "./dapClient";
 export type {
   EventBodyMap,
   EventName,

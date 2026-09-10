@@ -1,10 +1,10 @@
 import type { DebugProtocol } from "@vscode/debugprotocol";
+import { EventEmitter } from "node:events";
 import { DapClient } from "../client/dapClient";
 import { type AdapterDefinition, type AdapterProvider, createTransport, resolveAdapter } from "../transport/adapter";
 import type { Transport } from "../transport/transport";
 import type { Logger } from "../util/logger";
 import { noopLogger } from "../util/logger";
-import { TypedEventEmitter } from "../util/typedEmitter";
 import { Session } from "./session";
 import type { DebugConfiguration, SessionStartOptions } from "./types";
 
@@ -32,9 +32,11 @@ export interface SessionManagerOptions {
   transportFactory?: (adapter: AdapterDefinition, logger: Logger) => Transport;
 }
 
-export interface StartSessionOptions extends SessionStartOptions {
+export interface StartSessionOptions {
   /** Override the registered adapter for this run. */
   adapter?: AdapterProvider;
+  /** Options controlling the created session's startup behaviour. */
+  startOptions?: SessionStartOptions;
 }
 
 export type SessionManagerEvents = {
@@ -44,6 +46,8 @@ export type SessionManagerEvents = {
   sessionEnded: [Session];
   /** The active/focused session changed. */
   activeSessionChanged: [Session | undefined];
+  /** A session failed and closed. */
+  sessionError: [Session, Error];
 };
 
 interface SessionRecord {
@@ -60,7 +64,7 @@ interface SessionRecord {
  * the "active" session for UI/command routing, and spawns child sessions in
  * response to `startDebugging` reverse requests.
  */
-export class SessionManager extends TypedEventEmitter<SessionManagerEvents> {
+export class SessionManager extends EventEmitter<SessionManagerEvents> {
   private readonly adapters = new Map<string, AdapterProvider>();
   private readonly records = new Map<string, SessionRecord>();
   private _activeSession?: Session;
@@ -95,7 +99,7 @@ export class SessionManager extends TypedEventEmitter<SessionManagerEvents> {
       throw new Error(`No adapter registered for type '${config.type}'`);
     }
     const adapter = await resolveAdapter(provider, config);
-    const session = this.createSession(adapter, config, options);
+    const session = this.createSession(config, adapter, options.startOptions);
     try {
       await session.start();
     } catch (err) {
@@ -133,13 +137,13 @@ export class SessionManager extends TypedEventEmitter<SessionManagerEvents> {
 
   // ---- internals ----------------------------------------------------------
 
-  private createSession(adapter: AdapterDefinition, config: DebugConfiguration, options: SessionStartOptions, parent?: Session): Session {
+  private createSession(config: DebugConfiguration, adapter: AdapterDefinition, options?: SessionStartOptions, parent?: Session): Session {
     const transport = this.options.transportFactory ? this.options.transportFactory(adapter, this.logger) : createTransport(adapter, this.logger);
     const client = new DapClient(transport, {
       logger: this.logger,
       requestTimeoutMs: this.options.requestTimeoutMs,
     });
-    const session = new Session(client, config, { ...options, logger: this.logger });
+    const session = new Session(client, config, options, { logger: this.logger });
 
     if (parent) {
       session.parent = parent;
@@ -173,7 +177,7 @@ export class SessionManager extends TypedEventEmitter<SessionManagerEvents> {
     };
 
     const childAdapter = await this.resolveChildAdapter(parent, parentAdapter, childConfig);
-    const child = this.createSession(childAdapter, childConfig, {}, parent);
+    const child = this.createSession(childConfig, childAdapter, {}, parent);
     await child.start();
   }
 
@@ -202,15 +206,16 @@ export class SessionManager extends TypedEventEmitter<SessionManagerEvents> {
     this.setActiveSession(session);
     this.emit("sessionStarted", session);
 
-    const stoppedListener = session.on("stopped", () => {
+    const onStopped = () => {
       if (this.options.focusStoppedSession ?? true) {
         this.setActiveSession(session);
       }
-    });
+    };
+    session.on("stopped", onStopped);
+    session.on("sessionError", (error) => this.emit("sessionError", session, error));
 
-    const closeListener = session.on("close", () => {
-      stoppedListener.dispose();
-      closeListener.dispose();
+    session.once("close", () => {
+      session.off("stopped", onStopped);
       this.records.delete(session.id);
       this.emit("sessionEnded", session);
       if (this._activeSession === session) {

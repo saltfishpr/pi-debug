@@ -64,10 +64,11 @@ export class TcpTransport extends Transport {
 
       socket.once("connect", () => {
         socket.off("error", onError);
+
         this.socket = socket;
-        socket.on("data", (chunk: Buffer) => this.fire("data", chunk));
-        socket.on("error", (err) => this.fire("error", err));
-        socket.once("close", () => this.fire("close"));
+        socket.on("error", (err) => this.emit("error", err));
+        socket.on("data", (chunk: Buffer) => this.emit("data", chunk));
+        socket.once("close", () => this.emit("close"));
         resolve();
       });
     });

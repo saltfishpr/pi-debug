@@ -57,9 +57,9 @@ export class ServerExecutableTransport extends Transport {
     });
     this.child = child;
 
-    child.once("error", (err) => this.fire("error", err));
+    child.once("error", (err) => this.emit("error", err));
     child.stdout?.on("data", (chunk: Buffer) => this.logger.trace("adapter stdout", chunk.toString()));
-    child.stderr?.on("data", (chunk: Buffer) => this.fire("stderr", chunk));
+    child.stderr?.on("data", (chunk: Buffer) => this.emit("stderr", chunk));
 
     const inner = new TcpTransport({
       host: this.options.host,
@@ -71,9 +71,9 @@ export class ServerExecutableTransport extends Transport {
     });
     this.inner = inner;
 
-    inner.on("data", (chunk) => this.fire("data", chunk));
-    inner.on("error", (err) => this.fire("error", err));
-    inner.on("close", () => this.fire("close"));
+    inner.on("error", (err) => this.emit("error", err));
+    inner.on("data", (chunk) => this.emit("data", chunk));
+    inner.on("close", () => this.emit("close"));
 
     try {
       await inner.connect();
@@ -109,7 +109,7 @@ export class ServerExecutableTransport extends Transport {
 }
 
 /** Ask the OS for an unused TCP port by binding to port 0. */
-export function pickFreePort(): Promise<number> {
+function pickFreePort(): Promise<number> {
   return new Promise((resolve, reject) => {
     const server = createServer();
     server.unref();

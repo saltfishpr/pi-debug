@@ -49,12 +49,13 @@ export class StdioTransport extends Transport {
 
       child.once("spawn", () => {
         child.off("error", onSpawnError);
-        child.on("error", (err) => this.fire("error", err));
-        child.stdout.on("data", (chunk: Buffer) => this.fire("data", chunk));
-        child.stderr.on("data", (chunk: Buffer) => this.fire("stderr", chunk));
+
+        child.on("error", (err) => this.emit("error", err));
+        child.stdout.on("data", (chunk: Buffer) => this.emit("data", chunk));
+        child.stderr.on("data", (chunk: Buffer) => this.emit("stderr", chunk));
         child.once("close", (code) => {
           this.logger.debug("Adapter process exited", code);
-          this.fire("close");
+          this.emit("close");
         });
         resolve();
       });

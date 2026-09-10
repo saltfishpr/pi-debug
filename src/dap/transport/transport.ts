@@ -1,4 +1,4 @@
-import { TypedEventEmitter } from "../util/typedEmitter";
+import { EventEmitter } from "node:events";
 
 export type TransportEvents = {
   /** A chunk of raw bytes received from the adapter. */
@@ -16,9 +16,11 @@ export type TransportEvents = {
  *
  * Transports are deliberately protocol-agnostic: they move raw bytes and know
  * nothing about the DAP framing. Framing is handled one layer up by
- * {@link DapClient} via {@link MessageParser}.
+ * {@link DapClient} via {@link MessageParser}. Consumers must register an
+ * `error` listener before calling {@link connect}, following Node's
+ * {@link EventEmitter} contract.
  */
-export abstract class Transport extends TypedEventEmitter<TransportEvents> {
+export abstract class Transport extends EventEmitter<TransportEvents> {
   /** Establish the connection. Resolves once the transport is ready to use. */
   abstract connect(): Promise<void>;
 
@@ -34,11 +36,5 @@ export abstract class Transport extends TypedEventEmitter<TransportEvents> {
    */
   getEndpoint(): { host: string; port: number } | undefined {
     return undefined;
-  }
-
-  // `emit` is protected on TypedEventEmitter; expose a narrow surface so the
-  // concrete transports (which live in this module) can fire their events.
-  protected fire<K extends keyof TransportEvents & string>(event: K, ...args: TransportEvents[K]): void {
-    this.emit(event, ...args);
   }
 }

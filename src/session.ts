@@ -491,23 +491,23 @@ export class PiDebugSession {
         disposables.push(() => signal.removeEventListener("abort", onAbort));
       }
 
-      const stoppedSub = this.dapSession.on("stopped", (body) => {
+      const onStopped = (body: DebugProtocol.StoppedEvent["body"]) => {
         cleanup();
         void this.buildStopResult(body).then(resolve);
-      });
-      disposables.push(() => stoppedSub.dispose());
+      };
+      this.dapSession.on("stopped", onStopped);
+      disposables.push(() => this.dapSession.off("stopped", onStopped));
 
-      const terminatedSub = this.dapSession.on("terminated", () => {
+      const onTerminated = () => {
         cleanup();
         resolve({ state: "terminated" });
-      });
-      disposables.push(() => terminatedSub.dispose());
-
-      const closeSub = this.dapSession.on("close", () => {
-        cleanup();
-        resolve({ state: "terminated" });
-      });
-      disposables.push(() => closeSub.dispose());
+      };
+      this.dapSession.on("terminated", onTerminated);
+      this.dapSession.on("close", onTerminated);
+      disposables.push(
+        () => this.dapSession.off("terminated", onTerminated),
+        () => this.dapSession.off("close", onTerminated),
+      );
     });
   }
 

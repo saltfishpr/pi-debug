@@ -25,17 +25,27 @@ export type { DebugProtocol } from "@vscode/debugprotocol";
 
 // Primary API: manage and drive debug sessions.
 export { Session, SessionManager, SessionState } from "./session";
-export type { DebugConfiguration, RunInTerminalHandler, SessionManagerOptions, SessionStartOptions, StartSessionOptions, ThreadInfo } from "./session";
+export type {
+  DebugConfiguration,
+  RunInTerminalHandler,
+  SessionEvents,
+  SessionManagerEvents,
+  SessionManagerOptions,
+  SessionStartOptions,
+  StartSessionOptions,
+  ThreadInfo,
+} from "./session";
 
 // Adapter definitions used to register/reach adapters.
 export type { AdapterDefinition, AdapterFactory, AdapterProvider, ExecutableAdapter, ServerAdapter } from "./transport";
 
 // Lower-level client + transports (optional; SessionManager uses them for you).
 export { DapClient } from "./client";
+export type { DapClientEvents, DapClientOptions, RequestOptions, ReverseRequestHandler } from "./client";
 export { ServerExecutableTransport, StdioTransport, TcpTransport } from "./transport";
+export type { ServerExecutableOptions, StdioTransportOptions, TcpTransportOptions } from "./transport";
 
-// Logging, errors, and the disposable returned by event subscriptions.
+// Utility classes.
 export { DapConnectionError, DapResponseError, DapTimeoutError } from "./util/errors";
 export { ConsoleLogger, LogLevel } from "./util/logger";
 export type { Logger } from "./util/logger";
-export type { Disposable } from "./util/typedEmitter";
