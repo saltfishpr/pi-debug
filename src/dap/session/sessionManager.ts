@@ -190,7 +190,7 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
    */
   private async resolveChildAdapter(parent: Session, parentAdapter: AdapterDefinition, childConfig: DebugConfiguration): Promise<AdapterDefinition> {
     const provider = this.adapters.get(childConfig.type);
-    let adapter = provider ? await resolveAdapter(provider, childConfig) : parentAdapter;
+    let adapter = provider ? await resolveAdapter(provider, childConfig) : parentAdapter; // FIXME: 如果 start 传入了 adapterFactory，这里却没有使用它。
 
     if (parentAdapter.type === "server" && adapter.type === "server" && adapter.executable) {
       const endpoint = this.records.get(parent.id)?.transport.getEndpoint();

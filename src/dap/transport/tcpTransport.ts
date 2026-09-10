@@ -10,7 +10,7 @@ export interface TcpTransportOptions {
   /** TCP port the adapter listens on. */
   port: number;
   /** Number of connection attempts before giving up. Defaults to 1. */
-  maxRetries?: number;
+  maxAttempts?: number;
   /** Delay between retries in milliseconds. Defaults to 250. */
   retryDelayMs?: number;
   logger?: Logger;
@@ -33,19 +33,19 @@ export class TcpTransport extends Transport {
   }
 
   async connect(): Promise<void> {
-    const maxRetries = Math.max(1, this.options.maxRetries ?? 1);
+    const maxAttempts = Math.max(1, this.options.maxAttempts ?? 1);
     const retryDelayMs = this.options.retryDelayMs ?? 250;
 
     let lastError: Error | undefined;
-    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       try {
         await this.connectOnce();
         return;
       } catch (err) {
         lastError = err as Error;
-        this.logger.debug(`TCP connect attempt ${attempt}/${maxRetries} failed`, lastError.message);
-        if (attempt < maxRetries) {
-          await delay(retryDelayMs);
+        this.logger.debug(`TCP connect attempt ${attempt}/${maxAttempts} failed`, lastError.message);
+        if (attempt < maxAttempts) {
+          await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
         }
       }
     }
@@ -94,8 +94,4 @@ export class TcpTransport extends Transport {
     socket.removeAllListeners("data");
     socket.destroy();
   }
-}
-
-function delay(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }

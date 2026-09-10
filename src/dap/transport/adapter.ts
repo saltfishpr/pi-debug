@@ -87,7 +87,7 @@ export function createTransport(adapter: AdapterDefinition, logger?: Logger): Tr
       return new TcpTransport({
         host: adapter.host,
         port: adapter.port,
-        maxRetries: adapter.maxRetries,
+        maxAttempts: adapter.maxRetries,
         retryDelayMs: adapter.retryDelayMs,
         logger,
       });

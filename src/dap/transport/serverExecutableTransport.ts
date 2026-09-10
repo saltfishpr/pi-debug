@@ -65,7 +65,7 @@ export class ServerExecutableTransport extends Transport {
       host: this.options.host,
       port,
       // Poll while the freshly spawned server comes up.
-      maxRetries: Math.ceil((this.options.connectTimeoutMs ?? 5000) / 250),
+      maxAttempts: Math.ceil((this.options.connectTimeoutMs ?? 5000) / 250),
       retryDelayMs: 250,
       logger: this.logger,
     });
