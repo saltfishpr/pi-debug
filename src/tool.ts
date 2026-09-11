@@ -19,7 +19,7 @@ export function registerDebugTool(pi: ExtensionAPI, manager: SessionManager, con
     label: "Debug",
     description: [
       "Drive an interactive debugger over the Debug Adapter Protocol (DAP) to launch a program, set breakpoints, step through code, and read live state.",
-      "One call performs one `action`; results print the handles (`sessionId`, `threadId`, `[frameId=N]`, `[ref=N]`) that later calls need — feed them back verbatim.",
+      "One call performs one `action`; results use simple `name=value` fields and print the `sessionId`, `threadId`, `frameId`, and `ref` handles needed by later calls.",
       "Launches come from configurations declared in `.vscode/launch.json` or `.pi/launch.json`; use action `start` with a configuration `name` to run one.",
       "Breakpoints come in three kinds: `set_breakpoints` (by file+line, supports conditions and logpoints), `set_function_breakpoints` (by function name), `set_exception_breakpoints` (by adapter-defined filter); `list_breakpoints` shows all of them and the available exception filters.",
       "Typical loop: `start` → `set_breakpoints` → `continue` → inspect with `stack_trace` / `scopes` / `variables` / `evaluate` → `step_over` / `step_in` / `step_out` / `continue` → `stop`.",
@@ -31,7 +31,7 @@ export function registerDebugTool(pi: ExtensionAPI, manager: SessionManager, con
       "Prefer `debug` over running the program with `bash` whenever you need to pause execution, inspect variables, or step through logic; keep `bash` for pure build, test, or run-and-read-output tasks.",
       'To observe a value at a spot that is hit repeatedly (loops, callbacks), prefer a logpoint (`set_breakpoints` with `logMessage`, e.g. "n={n}") plus a single `continue`, then read `output` — this avoids many `step`/`continue` round-trips since logpoints log without stopping.',
       "Do not modify program code through `debug` — its `evaluate` and `variables` actions are for reading live state; use `edit` or `write` to change source, then re-run `debug` to verify the fix.",
-      "After each `debug` result, reuse the printed `[frameId=N]` and `[ref=N]` handles for follow-up `scopes` / `variables` / `evaluate` calls; do not invent numeric ids.",
+      "After each `debug` result, reuse the printed `frameId=N` and `ref=N` handles for follow-up `scopes` / `variables` / `evaluate` calls; do not invent numeric ids.",
       "Always end a `debug` investigation with action `stop` (or terminate/disconnect) so the debuggee and adapter process are cleaned up.",
     ],
     parameters: T.Object({
@@ -139,7 +139,7 @@ export function registerDebugTool(pi: ExtensionAPI, manager: SessionManager, con
       frameId: T.Optional(
         T.Integer({
           description:
-            "For 'scopes' (required) and 'evaluate' (optional): the stack frame to inspect or evaluate in. Use a frameId printed as '[frameId=N]' in a previous 'stack_trace' or stop result. For 'evaluate', omit to use the top frame.",
+            "For 'scopes' (required) and 'evaluate' (optional): the stack frame to inspect or evaluate in. Use a `frameId=N` value from a previous 'stack_trace' or stop result. For 'evaluate', omit to use the top frame.",
         }),
       ),
       levels: T.Optional(
@@ -151,7 +151,7 @@ export function registerDebugTool(pi: ExtensionAPI, manager: SessionManager, con
       variablesReference: T.Optional(
         T.Integer({
           description:
-            "For 'variables': the container to expand. Use a reference printed as '[ref=N]' next to a scope (from 'scopes') or an expandable variable (from a previous 'variables'/'evaluate').",
+            "For 'variables': the container to expand. Use a `ref=N` value from 'scopes' or an expandable value from 'variables'/'evaluate'.",
         }),
       ),
       expression: T.Optional(
@@ -171,10 +171,7 @@ export function registerDebugTool(pi: ExtensionAPI, manager: SessionManager, con
           const config = pickConfiguration(configurations, args.name);
           const session = await manager.createSession(config);
           await session.configureAndStart();
-          const summaryText = format.formatSessionSummary(session);
-          const stop = session.getStopState();
-          const text = stop ? `${summaryText}\n${format.formatStop(stop, session.id)}` : summaryText;
-          return ok(text, summarize(session));
+          return ok(format.formatSessionSummary(session), summarize(session));
         }
 
         case "set_breakpoints": {
@@ -183,7 +180,7 @@ export function registerDebugTool(pi: ExtensionAPI, manager: SessionManager, con
           const requested = required(args.breakpoints, "breakpoints", args.action);
           const verified = await session.setBreakpoints({ path, breakpoints: requested });
           const statuses = requested.map((bp, index) => ({ requested: bp, verified: verified[index] }));
-          return ok(format.formatBreakpoints(path, statuses), verified);
+          return ok(format.formatBreakpoints(path, statuses, session), verified);
         }
 
         case "set_function_breakpoints": {
@@ -191,7 +188,7 @@ export function registerDebugTool(pi: ExtensionAPI, manager: SessionManager, con
           const requested = required(args.functions, "functions", args.action);
           const verified = await session.setFunctionBreakpoints(requested);
           const statuses = requested.map((bp, index) => ({ requested: bp, verified: verified[index] }));
-          return ok(format.formatFunctionBreakpoints(statuses), verified);
+          return ok(format.formatFunctionBreakpoints(statuses, session), verified);
         }
 
         case "set_exception_breakpoints": {
@@ -199,13 +196,13 @@ export function registerDebugTool(pi: ExtensionAPI, manager: SessionManager, con
           const filters = required(args.filters, "filters", args.action);
           await session.setExceptionBreakpoints(filters, args.filterOptions);
           const { exception } = session.getBreakpointsSnapshot();
-          return ok(format.formatExceptionBreakpoints(exception), exception);
+          return ok(format.formatExceptionBreakpoints(exception, session), exception);
         }
 
         case "list_breakpoints": {
           const session = activeSession(manager, args.sessionId);
           const snapshot = session.getBreakpointsSnapshot();
-          return ok(format.formatBreakpointsSnapshot(snapshot), snapshot);
+          return ok(format.formatBreakpointsSnapshot(snapshot, session), snapshot);
         }
 
         case "continue": {
@@ -234,41 +231,41 @@ export function registerDebugTool(pi: ExtensionAPI, manager: SessionManager, con
         case "threads": {
           const session = activeSession(manager, args.sessionId);
           const threads = await session.listThreads();
-          return ok(format.formatThreads(threads, session.getStopState()?.threadId), threads);
+          return ok(format.formatThreads(threads, session), threads);
         }
 
         case "stack_trace": {
           const session = activeSession(manager, args.sessionId);
           const threadId = required(args.threadId ?? session.getStopState()?.threadId, "threadId", args.action);
           const frames = await session.getStackTrace(threadId, args.levels ? { levels: args.levels } : {});
-          return ok(format.formatStack(frames), frames);
+          return ok(format.formatStack(frames, session), frames);
         }
 
         case "scopes": {
           const session = activeSession(manager, args.sessionId);
           const frameId = required(args.frameId, "frameId", args.action);
           const scopes = await session.getScopes(frameId);
-          return ok(format.formatScopes(scopes), scopes);
+          return ok(format.formatScopes(scopes, session), scopes);
         }
 
         case "variables": {
           const session = activeSession(manager, args.sessionId);
           const ref = required(args.variablesReference, "variablesReference", args.action);
           const variables = await session.getVariables(ref);
-          return ok(format.formatVariables(variables), variables);
+          return ok(format.formatVariables(variables, session), variables);
         }
 
         case "evaluate": {
           const session = activeSession(manager, args.sessionId);
           const expression = required(args.expression, "expression", args.action);
           const body = await session.evaluate(expression, args.frameId);
-          return ok(body ? format.formatEvaluate(body) : "=> (no result)", body);
+          return ok(format.formatEvaluate(body, session), body);
         }
 
         case "output": {
           const session = activeSession(manager, args.sessionId);
           const events = session.getRecentOutput();
-          return ok(format.formatOutput(events), events);
+          return ok(format.formatOutput(events, session), events);
         }
 
         case "list_sessions":
@@ -284,7 +281,7 @@ export function registerDebugTool(pi: ExtensionAPI, manager: SessionManager, con
         case "stop": {
           const session = activeSession(manager, args.sessionId);
           await session.terminate();
-          return ok(format.formatTerminated(session.id, session.state), summarize(session));
+          return ok(format.formatStopRequest(session.id, session.state), summarize(session));
         }
       }
     },
