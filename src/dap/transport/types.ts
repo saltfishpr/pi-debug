@@ -16,8 +16,14 @@ export interface DapTransport {
   readonly onMessage: EventSource<DebugProtocol.ProtocolMessage>;
   /** Fired once when the channel closes (process exit / socket end). */
   readonly onClose: EventSource<TransportCloseEvent>;
-  /** Fired for transport-level (non-protocol) errors. */
+  /** Fired for *fatal* transport-level errors (stream error, framing failure) that end the channel. */
   readonly onError: EventSource<Error>;
+  /**
+   * Fired for *non-fatal* adapter diagnostics (e.g. child-process stderr).
+   * Optional: message-oriented transports have no such side channel. Consumers
+   * must treat this as observability only — it never closes the connection.
+   */
+  readonly onDiagnostic?: EventSource<string>;
 
   /** Establish the connection / spawn the process. Resolves once writable. */
   start(): Promise<void>;

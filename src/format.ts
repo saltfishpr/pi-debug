@@ -1,6 +1,6 @@
 import type { DebugProtocol } from "./dap/index.js";
 import type { DebugConfiguration } from "./launchConfig.js";
-import type { DebugSession, ResumeOutcome, SessionState, StopSnapshot } from "./session/index.js";
+import type { BreakpointsSnapshot, BreakpointStatus, DebugSession, ResumeOutcome, SessionState, StopSnapshot } from "./session/index.js";
 
 /**
  * Format L5's structured results into compact, self-describing text for the
@@ -61,15 +61,77 @@ export function formatResume(outcome: ResumeOutcome, sessionId: string): string 
   }
 }
 
-export function formatBreakpoints(path: string, breakpoints: DebugProtocol.Breakpoint[]): string {
-  if (breakpoints.length === 0) {
+function breakpointMark(verified?: DebugProtocol.Breakpoint): string {
+  if (!verified) {
+    return "· pending";
+  }
+  return verified.verified ? "✓ verified" : `✗ unverified${verified.message ? ` (${verified.message})` : ""}`;
+}
+
+/** Render the condition / hit-count / logpoint annotations of a requested breakpoint. */
+function breakpointConditions(requested: { condition?: string; hitCondition?: string; logMessage?: string }): string {
+  const parts: string[] = [];
+  if (requested.condition) parts.push(`if ${requested.condition}`);
+  if (requested.hitCondition) parts.push(`hit ${requested.hitCondition}`);
+  if (requested.logMessage) parts.push(`log ${JSON.stringify(requested.logMessage)} (logpoint)`);
+  return parts.length > 0 ? `  ${parts.join("  ")}` : "";
+}
+
+function breakpointId(verified?: DebugProtocol.Breakpoint): string {
+  return verified?.id !== undefined ? `  [id=${verified.id}]` : "";
+}
+
+export function formatBreakpoints(path: string, statuses: BreakpointStatus<DebugProtocol.SourceBreakpoint>[]): string {
+  if (statuses.length === 0) {
     return `breakpoints @ ${path}: none`;
   }
-  const lines = breakpoints.map((bp) => {
-    const mark = bp.verified ? "✓ verified" : `✗ unverified${bp.message ? ` (${bp.message})` : ""}`;
-    return `  ${bp.line ?? "?"} ${mark}`;
+  const lines = statuses.map(({ requested, verified }) => {
+    const line = verified?.line ?? requested.line;
+    return `  ${line} ${breakpointMark(verified)}${breakpointConditions(requested)}${breakpointId(verified)}`;
   });
   return [`breakpoints @ ${path}`, ...lines].join("\n");
+}
+
+export function formatFunctionBreakpoints(statuses: BreakpointStatus<DebugProtocol.FunctionBreakpoint>[]): string {
+  if (statuses.length === 0) {
+    return "function breakpoints: none";
+  }
+  const lines = statuses.map(
+    ({ requested, verified }) => `  ${requested.name} ${breakpointMark(verified)}${breakpointConditions(requested)}${breakpointId(verified)}`,
+  );
+  return ["function breakpoints:", ...lines].join("\n");
+}
+
+export function formatExceptionBreakpoints(exception: BreakpointsSnapshot["exception"]): string {
+  const { filters, filterOptions, available } = exception;
+  if (available.length === 0) {
+    return "exception breakpoints: not supported by this adapter";
+  }
+  const enabled = new Set([...filters, ...filterOptions.map((option) => option.filterId)]);
+  const conditionById = new Map(filterOptions.map((option) => [option.filterId, option.condition]));
+  const lines = available.map((filter) => {
+    const box = enabled.has(filter.filter) ? "[x]" : "[ ]";
+    const condition = conditionById.get(filter.filter);
+    const conditionMark = condition ? `  if ${condition}` : "";
+    const flags = [filter.default ? "default" : "", filter.supportsCondition ? "cond" : ""].filter(Boolean).join(",");
+    const flagMark = flags ? ` (${flags})` : "";
+    return `  ${box} ${filter.filter}${flagMark} — ${filter.label}${conditionMark}`;
+  });
+  return ["exception breakpoints: ([x] = on)", ...lines].join("\n");
+}
+
+export function formatBreakpointsSnapshot(snapshot: BreakpointsSnapshot): string {
+  const sections: string[] = [];
+  if (snapshot.source.length === 0) {
+    sections.push("source breakpoints: none");
+  } else {
+    for (const { path, breakpoints } of snapshot.source) {
+      sections.push(formatBreakpoints(path, breakpoints));
+    }
+  }
+  sections.push(formatFunctionBreakpoints(snapshot.function));
+  sections.push(formatExceptionBreakpoints(snapshot.exception));
+  return sections.join("\n");
 }
 
 export function formatStack(frames: DebugProtocol.StackFrame[]): string {

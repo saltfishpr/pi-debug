@@ -11,6 +11,8 @@ import type { DapTransport } from "./transport/types.js";
 export interface DapTracer {
   onSend?(message: DebugProtocol.ProtocolMessage): void;
   onReceive?(message: DebugProtocol.ProtocolMessage): void;
+  /** Non-fatal adapter diagnostics (e.g. child-process stderr). Observability only. */
+  onDiagnostic?(text: string): void;
 }
 
 export interface DapConnectionOptions {
@@ -76,6 +78,8 @@ export class DapConnection {
     transport.onMessage((message) => this.enqueue(message));
     transport.onError((error) => this.shutdown(error));
     transport.onClose(() => this.shutdown());
+    // Non-fatal diagnostics (stderr) are observed, never fatal: do not shut down.
+    transport.onDiagnostic?.((text) => this.options.tracer?.onDiagnostic?.(text));
   }
 
   /** Send a request and await its response. Rejects on failure/timeout/abort. */

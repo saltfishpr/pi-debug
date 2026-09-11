@@ -3,6 +3,8 @@ export { commandAdapter, pipeAdapter, serverAdapter, spawnServerAdapter } from "
 export { SessionManager } from "./manager.js";
 export { DebugSession } from "./session.js";
 export type {
+  BreakpointsSnapshot,
+  BreakpointStatus,
   DebugAdapterFactory,
   DebugSessionContext,
   ResumeOutcome,
@@ -10,5 +12,4 @@ export type {
   SessionState,
   SourceBreakpointSpec,
   StopSnapshot,
-  VerifiedBreakpoint,
 } from "./types.js";

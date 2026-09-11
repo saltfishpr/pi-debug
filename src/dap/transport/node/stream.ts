@@ -14,6 +14,7 @@ export abstract class StreamTransport implements DapTransport {
   protected readonly _onMessage = new Emitter<DebugProtocol.ProtocolMessage>();
   protected readonly _onClose = new Emitter<TransportCloseEvent>();
   protected readonly _onError = new Emitter<Error>();
+  protected readonly _onDiagnostic = new Emitter<string>();
   private readonly decoder = new MessageDecoder();
   private writable?: Writable;
   private disposed = false;
@@ -21,6 +22,7 @@ export abstract class StreamTransport implements DapTransport {
   readonly onMessage = this._onMessage.event;
   readonly onClose = this._onClose.event;
   readonly onError = this._onError.event;
+  readonly onDiagnostic = this._onDiagnostic.event;
 
   abstract start(): Promise<void>;
 
@@ -57,6 +59,7 @@ export abstract class StreamTransport implements DapTransport {
     this._onMessage.dispose();
     this._onClose.dispose();
     this._onError.dispose();
+    this._onDiagnostic.dispose();
   }
 
   /** Subclasses release their resources (kill process / end socket). */

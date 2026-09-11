@@ -33,10 +33,23 @@ export interface SourceBreakpointSpec {
   breakpoints: DebugProtocol.SourceBreakpoint[];
 }
 
-/** Verified breakpoint state, reconciled from responses and `breakpoint` events. */
-export interface VerifiedBreakpoint {
-  path: string;
-  breakpoint: DebugProtocol.Breakpoint;
+/** A requested breakpoint paired with the adapter's verified result (if any). */
+export interface BreakpointStatus<Requested> {
+  requested: Requested;
+  /** Reconciled from the `setBreakpoints` response and `breakpoint` events; absent until sent. */
+  verified?: DebugProtocol.Breakpoint;
+}
+
+/** A coherent view of every breakpoint the session tracks, for `list_breakpoints`. */
+export interface BreakpointsSnapshot {
+  source: { path: string; breakpoints: BreakpointStatus<DebugProtocol.SourceBreakpoint>[] }[];
+  function: BreakpointStatus<DebugProtocol.FunctionBreakpoint>[];
+  exception: {
+    filters: string[];
+    filterOptions: DebugProtocol.ExceptionFilterOptions[];
+    /** Filters the adapter advertised in `initialize` (`exceptionBreakpointFilters`). */
+    available: DebugProtocol.ExceptionBreakpointsFilter[];
+  };
 }
 
 /** Everything a single session needs; assembled and injected by the manager. */

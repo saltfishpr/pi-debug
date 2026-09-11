@@ -1,7 +1,7 @@
 import type { DapTransport, DebugProtocol } from "../dap/index.js";
 import { DapConnection, DebugClient, Emitter, type Disposable, type EventSource } from "../dap/index.js";
 import type { DebugConfiguration } from "../launchConfig.js";
-import type { DebugSessionContext, ResumeOutcome, SessionState, SourceBreakpointSpec, StopSnapshot, VerifiedBreakpoint } from "./types.js";
+import type { BreakpointsSnapshot, DebugSessionContext, ResumeOutcome, SessionState, SourceBreakpointSpec, StopSnapshot } from "./types.js";
 
 interface Deferred<T> {
   readonly promise: Promise<T>;
@@ -44,7 +44,10 @@ export class DebugSession {
 
   private readonly desiredBreakpoints = new Map<string, DebugProtocol.SourceBreakpoint[]>();
   private readonly verifiedBreakpoints = new Map<string, DebugProtocol.Breakpoint[]>();
+  private desiredFunctionBreakpoints: DebugProtocol.FunctionBreakpoint[] = [];
+  private verifiedFunctionBreakpoints: DebugProtocol.Breakpoint[] = [];
   private exceptionFilters: string[] = [];
+  private exceptionFilterOptions: DebugProtocol.ExceptionFilterOptions[] = [];
   private readonly outputBuffer: DebugProtocol.OutputEvent[] = [];
 
   private readonly subscriptions: Disposable[] = [];
@@ -159,6 +162,7 @@ export class DebugSession {
   // --- Breakpoints (desired state, resent on configure) -------------------
 
   async setBreakpoints(spec: SourceBreakpointSpec): Promise<DebugProtocol.Breakpoint[]> {
+    this.assertBreakpointCapabilities(spec.breakpoints);
     this.desiredBreakpoints.set(spec.path, spec.breakpoints);
     if (!this.canSendBreakpoints()) {
       return [];
@@ -166,21 +170,47 @@ export class DebugSession {
     return this.applySourceBreakpoints(spec.path, spec.breakpoints);
   }
 
-  async setExceptionBreakpoints(filters: string[]): Promise<void> {
-    this.exceptionFilters = [...filters];
-    if (this.canSendBreakpoints()) {
-      await this.client.setExceptionBreakpoints({ filters: this.exceptionFilters });
+  async setFunctionBreakpoints(breakpoints: DebugProtocol.FunctionBreakpoint[]): Promise<DebugProtocol.Breakpoint[]> {
+    if (breakpoints.length > 0 && !this.client.capabilities.supportsFunctionBreakpoints) {
+      throw new Error("this debug adapter does not support function breakpoints");
     }
+    this.assertBreakpointCapabilities(breakpoints);
+    this.desiredFunctionBreakpoints = [...breakpoints];
+    if (!this.canSendBreakpoints()) {
+      return [];
+    }
+    return this.applyFunctionBreakpoints();
   }
 
-  listBreakpoints(): ReadonlyArray<VerifiedBreakpoint> {
-    const result: VerifiedBreakpoint[] = [];
-    for (const [path, breakpoints] of this.verifiedBreakpoints) {
-      for (const breakpoint of breakpoints) {
-        result.push({ path, breakpoint });
-      }
+  async setExceptionBreakpoints(filters: string[], filterOptions: DebugProtocol.ExceptionFilterOptions[] = []): Promise<DebugProtocol.Breakpoint[]> {
+    this.assertExceptionCapabilities(filters, filterOptions);
+    this.exceptionFilters = [...filters];
+    this.exceptionFilterOptions = [...filterOptions];
+    if (!this.canSendBreakpoints()) {
+      return [];
     }
-    return result;
+    return this.applyExceptionBreakpoints();
+  }
+
+  getAvailableExceptionFilters(): ReadonlyArray<DebugProtocol.ExceptionBreakpointsFilter> {
+    return this.client.capabilities.exceptionBreakpointFilters ?? [];
+  }
+
+  /** A coherent view of all tracked breakpoints (requested + verified), for `list_breakpoints`. */
+  getBreakpointsSnapshot(): BreakpointsSnapshot {
+    const source = [...this.desiredBreakpoints].map(([path, requested]) => {
+      const verified = this.verifiedBreakpoints.get(path) ?? [];
+      return { path, breakpoints: requested.map((bp, index) => ({ requested: bp, verified: verified[index] })) };
+    });
+    return {
+      source,
+      function: this.desiredFunctionBreakpoints.map((bp, index) => ({ requested: bp, verified: this.verifiedFunctionBreakpoints[index] })),
+      exception: {
+        filters: [...this.exceptionFilters],
+        filterOptions: [...this.exceptionFilterOptions],
+        available: [...this.getAvailableExceptionFilters()],
+      },
+    };
   }
 
   // --- Execution control: resolve on the next stop/exit (§5.2) ------------
@@ -331,8 +361,11 @@ export class DebugSession {
     for (const [path, breakpoints] of this.desiredBreakpoints) {
       await this.applySourceBreakpoints(path, breakpoints);
     }
-    if (this.exceptionFilters.length > 0) {
-      await this.client.setExceptionBreakpoints({ filters: this.exceptionFilters });
+    if (this.desiredFunctionBreakpoints.length > 0) {
+      await this.applyFunctionBreakpoints();
+    }
+    if (this.exceptionFilters.length > 0 || this.exceptionFilterOptions.length > 0) {
+      await this.applyExceptionBreakpoints();
     }
   }
 
@@ -341,6 +374,56 @@ export class DebugSession {
     const verified = response.body?.breakpoints ?? [];
     this.verifiedBreakpoints.set(path, verified);
     return verified;
+  }
+
+  private async applyFunctionBreakpoints(): Promise<DebugProtocol.Breakpoint[]> {
+    const response = await this.client.setFunctionBreakpoints({ breakpoints: this.desiredFunctionBreakpoints });
+    this.verifiedFunctionBreakpoints = response.body?.breakpoints ?? [];
+    return this.verifiedFunctionBreakpoints;
+  }
+
+  private async applyExceptionBreakpoints(): Promise<DebugProtocol.Breakpoint[]> {
+    const args: DebugProtocol.SetExceptionBreakpointsArguments = { filters: this.exceptionFilters };
+    if (this.exceptionFilterOptions.length > 0) {
+      args.filterOptions = this.exceptionFilterOptions;
+    }
+    const response = await this.client.setExceptionBreakpoints(args);
+    return response.body?.breakpoints ?? [];
+  }
+
+  /** Strict, fail-fast capability check: an adapter silently ignores unsupported fields. */
+  private assertBreakpointCapabilities(breakpoints: ReadonlyArray<DebugProtocol.SourceBreakpoint | DebugProtocol.FunctionBreakpoint>): void {
+    const caps = this.client.capabilities;
+    for (const bp of breakpoints) {
+      if (bp.condition && !caps.supportsConditionalBreakpoints) {
+        throw new Error("this debug adapter does not support conditional breakpoints ('condition')");
+      }
+      if (bp.hitCondition && !caps.supportsHitConditionalBreakpoints) {
+        throw new Error("this debug adapter does not support hit-count breakpoints ('hitCondition')");
+      }
+      if ("logMessage" in bp && bp.logMessage && !caps.supportsLogPoints) {
+        throw new Error("this debug adapter does not support logpoints ('logMessage')");
+      }
+    }
+  }
+
+  private assertExceptionCapabilities(filters: string[], filterOptions: DebugProtocol.ExceptionFilterOptions[]): void {
+    const available = this.getAvailableExceptionFilters();
+    if (available.length === 0) {
+      if (filters.length > 0 || filterOptions.length > 0) {
+        throw new Error("this debug adapter does not support exception breakpoints");
+      }
+      return;
+    }
+    const validIds = new Set(available.map((filter) => filter.filter));
+    const requestedIds = [...filters, ...filterOptions.map((option) => option.filterId)];
+    const unknown = requestedIds.filter((id) => !validIds.has(id));
+    if (unknown.length > 0) {
+      throw new Error(`unknown exception filter(s): ${unknown.join(", ")}. Available: ${[...validIds].join(", ")}`);
+    }
+    if (filterOptions.length > 0 && !this.client.capabilities.supportsExceptionFilterOptions) {
+      throw new Error("this debug adapter does not support conditional exception filters ('filterOptions')");
+    }
   }
 
   /**
@@ -447,6 +530,10 @@ export class DebugSession {
         breakpoints[index] = updated;
         return;
       }
+    }
+    const functionIndex = this.verifiedFunctionBreakpoints.findIndex((bp) => bp.id === updated.id);
+    if (functionIndex >= 0) {
+      this.verifiedFunctionBreakpoints[functionIndex] = updated;
     }
   }
 

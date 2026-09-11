@@ -65,9 +65,10 @@ export class SubprocessSocketTransport extends StreamTransport {
 
     child.on("error", (err) => this._onError.fire(err));
     child.on("exit", (code) => this.fireClose({ code, requested: false }));
-    // Surface stderr as diagnostics; drain stdout so the server never blocks.
+    // stderr is non-fatal server diagnostics, not a transport error; drain both
+    // pipes so the server never blocks, but never let stderr close the connection.
     child.stderr?.on("data", (chunk: Buffer) => {
-      this._onError.fire(new Error(`adapter stderr: ${chunk.toString("utf8").trimEnd()}`));
+      this._onDiagnostic.fire(chunk.toString("utf8").trimEnd());
     });
     child.stdout?.on("data", () => {});
 

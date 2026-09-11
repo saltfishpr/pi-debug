@@ -34,9 +34,10 @@ export class StdioTransport extends StreamTransport {
 
     child.on("error", (err) => this._onError.fire(err));
     child.on("exit", (code) => this.fireClose({ code, requested: false }));
-    // Drain stderr so the adapter never blocks; surface it as diagnostics.
+    // stderr is non-fatal adapter diagnostics, not a transport error; drain it
+    // so the adapter never blocks, but never let it close the connection.
     child.stderr?.on("data", (chunk: Buffer) => {
-      this._onError.fire(new Error(`adapter stderr: ${chunk.toString("utf8").trimEnd()}`));
+      this._onDiagnostic.fire(chunk.toString("utf8").trimEnd());
     });
 
     await new Promise<void>((resolve, reject) => {
