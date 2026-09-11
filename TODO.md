@@ -1,5 +1,0 @@
-- [ ] debug tool renderCall
-- [ ] tool execute signal 需要透传下去，支持用户手动取消执行
-- [ ] stop 语义：如果 adapter 不是当前进程启动的，只 disconnect，不 terminate；如果 adapter 是当前进程启动的，terminate 并 disconnect
-- [ ] restart action
-- [ ] getRecentOutput 支持清空，暴露给 agent，默认清空

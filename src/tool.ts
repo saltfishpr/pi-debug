@@ -1,5 +1,6 @@
 import { StringEnum, Type as T } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { Text } from "@earendil-works/pi-tui";
 import * as format from "./format.js";
 import { type DebugConfiguration } from "./launchConfig.js";
 import type { DebugSession, SessionManager, SessionState } from "./session/index.js";
@@ -150,8 +151,7 @@ export function registerDebugTool(pi: ExtensionAPI, manager: SessionManager, con
       ),
       variablesReference: T.Optional(
         T.Integer({
-          description:
-            "For 'variables': the container to expand. Use a `ref=N` value from 'scopes' or an expandable value from 'variables'/'evaluate'.",
+          description: "For 'variables': the container to expand. Use a `ref=N` value from 'scopes' or an expandable value from 'variables'/'evaluate'.",
         }),
       ),
       expression: T.Optional(
@@ -284,6 +284,55 @@ export function registerDebugTool(pi: ExtensionAPI, manager: SessionManager, con
           return ok(format.formatStopRequest(session.id, session.state), summarize(session));
         }
       }
+    },
+
+    renderCall(args, theme, context) {
+      const component = context.lastComponent instanceof Text ? context.lastComponent : new Text("", 0, 0);
+      const parts = [theme.fg("toolTitle", theme.bold("debug")), theme.fg("accent", args.action || "...")];
+      const add = (name: string, value: string | number | undefined): void => {
+        if (value !== undefined) parts.push(theme.fg("muted", name + "=" + (typeof value === "string" ? JSON.stringify(value) : value)));
+      };
+
+      switch (args.action) {
+        case "start":
+          add("name", args.name);
+          break;
+        case "set_breakpoints":
+          add("path", args.path);
+          if (args.breakpoints) add("lines", args.breakpoints.map((breakpoint) => breakpoint.line).join(","));
+          break;
+        case "set_function_breakpoints":
+          if (args.functions) add("functions", args.functions.map((fn) => fn.name).join(","));
+          break;
+        case "set_exception_breakpoints":
+          if (args.filters) add("filters", args.filters.join(","));
+          break;
+        case "stack_trace":
+          add("thread", args.threadId);
+          add("levels", args.levels);
+          break;
+        case "scopes":
+          add("frame", args.frameId);
+          break;
+        case "variables":
+          add("ref", args.variablesReference);
+          break;
+        case "evaluate":
+          add("expression", args.expression);
+          add("frame", args.frameId);
+          break;
+        case "continue":
+        case "step_over":
+        case "step_in":
+        case "step_out":
+        case "pause":
+          add("thread", args.threadId);
+          break;
+      }
+
+      add("session", args.sessionId);
+      component.setText(parts.join(" "));
+      return component;
     },
   });
 }
