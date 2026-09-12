@@ -1,8 +1,9 @@
 import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
 import { parse as parseJsonc, printParseErrorCode, type ParseError } from "jsonc-parser";
 import { readFile } from "node:fs/promises";
-import { basename, join } from "node:path";
+import { join } from "node:path";
 import { z } from "zod";
+import { resolveVariables } from "./variables.js";
 
 const debugConfigurationSchema = z
   .object({
@@ -12,10 +13,12 @@ const debugConfigurationSchema = z
   })
   .loose();
 
+/** Named VS Code launch/attach configuration; adapter-specific fields are preserved. */
 export type DebugConfiguration = z.infer<typeof debugConfigurationSchema>;
 
 const launchFileSchema = z.object({ configurations: z.array(debugConfigurationSchema) }).loose();
 
+/** Load and resolve project JSONC configurations; same-name Pi entries replace VS Code entries. */
 export async function loadDebugConfigurations(cwd: string): Promise<DebugConfiguration[]> {
   const paths = [join(cwd, ".vscode", "launch.json"), join(cwd, CONFIG_DIR_NAME, "launch.json")];
   const configurations = (await Promise.all(paths.map(loadLaunchFile))).flat();
@@ -23,10 +26,6 @@ export async function loadDebugConfigurations(cwd: string): Promise<DebugConfigu
   const indexesByName = new Map<string, number>();
 
   for (const configuration of configurations) {
-    if (!configuration.name) {
-      merged.push(configuration);
-      continue;
-    }
     const index = indexesByName.get(configuration.name);
     if (index === undefined) {
       indexesByName.set(configuration.name, merged.length);
@@ -36,7 +35,7 @@ export async function loadDebugConfigurations(cwd: string): Promise<DebugConfigu
     }
   }
 
-  return merged.map((configuration) => resolveDebugConfiguration(configuration, { workspaceFolder: cwd, env: process.env }));
+  return resolveVariables(merged, cwd);
 }
 
 async function loadLaunchFile(path: string): Promise<DebugConfiguration[]> {
@@ -57,46 +56,16 @@ async function loadLaunchFile(path: string): Promise<DebugConfiguration[]> {
 
   const result = launchFileSchema.safeParse(parsed);
   if (!result.success) {
-    const details = result.error.issues.map((issue) => `${issue.path.join(".") || "root"}: ${issue.message}`).join(", ");
+    const details = result.error.issues
+      .map((issue) => `${issue.path.join(".") || "root"}: ${issue.message}`)
+      .join(", ");
     throw new Error(`Invalid ${path}: ${details}`);
   }
-  if (result.data.configurations.length === 0) {
-    throw new Error(`Invalid ${path}: expected at least one configuration`);
+  const names = new Set<string>();
+  for (const configuration of result.data.configurations) {
+    if (names.has(configuration.name)) throw new Error(`Duplicate configuration '${configuration.name}' in ${path}`);
+    names.add(configuration.name);
   }
 
   return result.data.configurations;
-}
-
-interface DebugConfigurationResolveContext {
-  workspaceFolder: string;
-  env: NodeJS.ProcessEnv;
-}
-
-function resolveDebugConfiguration(configuration: DebugConfiguration, context: DebugConfigurationResolveContext): DebugConfiguration {
-  return resolveValue(configuration, context) as DebugConfiguration;
-}
-
-function resolveValue(value: unknown, context: DebugConfigurationResolveContext): unknown {
-  if (typeof value === "string") return resolveString(value, context);
-  if (Array.isArray(value)) return value.map((item) => resolveValue(item, context));
-  if (value !== null && typeof value === "object") {
-    return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, resolveValue(item, context)]));
-  }
-  return value;
-}
-
-function resolveString(value: string, context: DebugConfigurationResolveContext): string {
-  return value.replace(/\$\{([^}]+)\}/g, (variable, name: string) => {
-    if (name === "workspaceFolder") return context.workspaceFolder;
-    if (name === "workspaceFolderBasename") return basename(context.workspaceFolder);
-    if (name.startsWith("env:")) {
-      const envName = name.slice("env:".length);
-      const envValue = context.env[envName];
-      if (envValue !== undefined) return envValue;
-      throw new Error(`Debug configuration variable '${variable}' is not defined`);
-    }
-    throw new Error(
-      `Unsupported debug configuration variable '${variable}'. Supported variables: \${workspaceFolder}, \${workspaceFolderBasename}, \${env:NAME}`,
-    );
-  });
 }

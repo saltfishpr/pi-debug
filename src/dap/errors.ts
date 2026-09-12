@@ -1,74 +1,42 @@
 import type { DebugProtocol } from "@vscode/debugprotocol";
 
-/** Base class for all errors surfaced by the DAP client. */
+/**
+ * DAP 模块所有自定义错误的基类。子类只用于区分错误来源，不携带额外字段。
+ * 统一继承 `DapError` 便于调用方用 `instanceof` 做粗粒度分类。
+ */
 export class DapError extends Error {
-  constructor(message: string) {
-    super(message);
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
     this.name = new.target.name;
   }
 }
 
-/** The requested command is not supported by the adapter's capabilities. */
-export class DapUnsupportedError extends DapError {
-  constructor(
-    readonly command: string,
-    readonly capability: string,
-  ) {
-    super(`Command '${command}' is not supported (missing capability '${capability}').`);
-  }
-}
+/** 连接已关闭：transport 已断开或 client 已终止，后续读写都会失败。 */
+export class ConnectionClosedError extends DapError {}
 
-/** A request did not receive a response within its timeout. */
-export class DapTimeoutError extends DapError {
-  constructor(
-    readonly command: string,
-    readonly timeoutMs: number,
-  ) {
-    super(`Timeout after ${timeoutMs}ms waiting for response to '${command}'.`);
-  }
-}
+/** 协议错误：收到不符合 DAP 规范的字节流、帧头或消息结构，连接不可恢复。 */
+export class ProtocolError extends DapError {}
 
-/** The connection/transport closed before a request could complete. */
-export class DapConnectionClosedError extends DapError {
-  constructor(readonly command?: string) {
-    super(command ? `Connection closed before '${command}' completed.` : "Connection closed.");
-  }
-}
+/** 请求超时：等待响应或建立连接时超过了配置的超时时间。 */
+export class RequestTimeoutError extends DapError {}
 
-/** A request was cancelled via its AbortSignal. */
-export class DapCancellationError extends DapError {
-  constructor(readonly command: string) {
-    super(`Request '${command}' was cancelled.`);
-  }
-}
+/** 请求被取消：调用方通过 AbortSignal 主动放弃了等待。 */
+export class RequestAbortedError extends DapError {}
 
-/** The adapter returned an unsuccessful response (`success: false`). */
-export class DapResponseError extends DapError {
-  readonly response: DebugProtocol.Response;
-  /** Structured error payload, if the adapter provided one (`ErrorResponse.body.error`). */
-  readonly body?: DebugProtocol.Message;
-
-  constructor(response: DebugProtocol.Response) {
-    const error = (response as DebugProtocol.ErrorResponse).body?.error;
-    // Prefer the structured error's interpolated `format`, then the short
-    // `message`, then a generic fallback (mirrors VS Code's rawDebugSession).
-    const detail = error ? formatMessage(error) : response.message;
-    super(detail || `Request '${response.command}' failed.`);
-    this.response = response;
-    this.body = error;
-  }
-}
+/** 使用了 Adapter 未通过 initialize 声明支持的能力。 */
+export class UnsupportedCapabilityError extends DapError {}
 
 /**
- * Render a DAP `Message` into a human-readable string by substituting its
- * `{name}` placeholders with the matching entries in `variables` (per the DAP
- * spec). Placeholders without a matching variable are left untouched.
+ * DAP 请求成功送达但 Adapter 返回 `success=false` 时抛出。
+ * `response` 保留原始响应，供调用方读取 `body` / `message` 等诊断信息。
  */
-function formatMessage(message: DebugProtocol.Message): string {
-  return message.format.replace(/\{([^}]+)\}/g, (match, name: string) =>
-    message.variables && Object.prototype.hasOwnProperty.call(message.variables, name) ? message.variables[name] : match,
-  );
+export class DapResponseError extends DapError {
+  constructor(readonly response: DebugProtocol.Response) {
+    super(response.message ?? `DAP request '${response.command}' failed`);
+  }
 }
 
-/** Malformed data on the wire (framing or JSON parse failure). */
-export class DapProtocolError extends DapError {}
+/** 把任意 thrown value 归一化成 `Error`，用于统一错误传播路径。 */
+export function asError(value: unknown): Error {
+  return value instanceof Error ? value : new Error(String(value));
+}
