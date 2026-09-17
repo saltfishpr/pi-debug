@@ -47,22 +47,25 @@ export class DebugSession {
   private readonly launchCommand: "launch" | "attach";
   /** initialize 请求中声明的 Debug Adapter 标识。 */
   private readonly adapterID: string;
+  /** Adapter 声明及后续动态更新的能力集合。 */
+  private capabilities: DebugProtocol.Capabilities = {};
+
+  // -- 生命周期与通知 ----------------------------------------------------------
 
   /** 当前调试会话状态。 */
   private state: "starting" | "running" | "stopped" | "terminated" = "starting";
   /** 标记 Adapter 是否已发送 initialized 事件。 */
   private initialized = false;
-  /** Adapter 声明及后续动态更新的能力集合。 */
-  private capabilities: DebugProtocol.Capabilities = {};
   /** 连接异常终止时记录的失败信息。 */
   private failure: string | undefined;
   /** 被调试进程通过 exited 事件报告的退出码。 */
   private exitCode: number | undefined;
   /** 共享的关闭流程 Promise，用于保证 close 幂等。 */
   private closing: Promise<void> | undefined;
-
   /** 会话状态变化通知器，供异步等待逻辑订阅。 */
   private readonly changes = new EventEmitter();
+
+  // -- 线程状态与事件顺序 ------------------------------------------------------
 
   /** 线程目录与事件确认的停止状态；不缓存帧或变量引用。 */
   private readonly threads = new Map<number, ThreadRecord>();
@@ -74,7 +77,6 @@ export class DebugSession {
   private allStopped = false;
   /** 尚未枚举的线程继承最近的全局事件；局部继续不能抹掉其他线程的全停证据。 */
   private defaultStopped: boolean | undefined;
-
   /** 执行状态的修订号，用于识别早于请求响应到达的 stopped 事件。 */
   private revision = 0;
   /** 记录最近一次 stopped 事件对应的修订号，用于等待新一次停止。 */
@@ -83,6 +85,8 @@ export class DebugSession {
   private allStoppedRevision = 0;
   /** 记录最近一次 allThreadsContinued 事件的修订号，用于判断是否需要根据响应补写线程状态。 */
   private allContinuedRevision = 0;
+
+  // -- Adapter 输出 -----------------------------------------------------------
 
   /** 尚未通过 status 返回的 Adapter 输出。 */
   private output = "";
@@ -100,14 +104,20 @@ export class DebugSession {
     client.onOutput("stdout", (data) => this.appendOutput(data.toString("utf8")));
     client.onClose((error) => {
       if (this.state !== "terminated") this.failure = error.message;
-      this.state = "terminated";
-      this.threads.clear();
-      this.selectedThread = undefined;
-      this.allStopped = false;
-      this.defaultStopped = undefined;
-      this.revision++;
-      this.changes.emit("change");
+      this.markTerminated();
     });
+  }
+
+  /** 收敛终止流程共用的状态清理：状态、线程目录、修订号推进与变化通知。 */
+  private markTerminated(): void {
+    this.state = "terminated";
+    this.threads.clear();
+    this.exitedThreads.clear();
+    this.selectedThread = undefined;
+    this.allStopped = false;
+    this.defaultStopped = undefined;
+    this.revision++;
+    this.changes.emit("change");
   }
 
   // -- 生命周期 -------------------------------------------------------------
@@ -146,7 +156,10 @@ export class DebugSession {
         for (const item of initialBreakpoints) {
           breakpoints.push(await this.setBreakpoints(item.file, item.lines, signal));
         }
-        if (this.capabilities.exceptionBreakpointFilters?.length) {
+        if (
+          !this.capabilities.supportsConfigurationDoneRequest ||
+          this.capabilities.exceptionBreakpointFilters?.length
+        ) {
           await this.request("setExceptionBreakpoints", { filters: [] }, signal);
         }
         if (this.capabilities.supportsConfigurationDoneRequest) {
@@ -167,26 +180,19 @@ export class DebugSession {
   }
 
   /** 幂等断开 DAP 会话并释放底层客户端资源。 */
-  close(terminateDebuggee = this.launchCommand === "launch"): Promise<void> {
+  close(terminateDebuggee?: boolean): Promise<void> {
+    terminateDebuggee ??= this.launchCommand === "launch";
     this.closing ??= (async () => {
       try {
-        if (this.initialized) {
-          await this.client.request(
-            "disconnect",
-            this.capabilities.supportTerminateDebuggee ? { terminateDebuggee } : {},
-            { timeoutMs: 3000 },
-          );
-        }
+        await this.client.request(
+          "disconnect",
+          this.capabilities.supportTerminateDebuggee ? { terminateDebuggee } : {},
+          { timeoutMs: 3000 },
+        );
       } catch {
         // Adapter 失败或断开连接时，仍须继续清理底层 transport。
       } finally {
-        this.state = "terminated";
-        this.threads.clear();
-        this.allStopped = false;
-        this.defaultStopped = undefined;
-        this.selectedThread = undefined;
-        this.revision++;
-        this.changes.emit("change");
+        this.markTerminated();
         await this.client.close();
       }
     })();
@@ -301,31 +307,8 @@ export class DebugSession {
   /** 分页获取目标线程的调用栈，frame 始终使用整个栈的零基索引。 */
   async stackTrace(threadId?: number, start = 0, count = 20, signal?: AbortSignal) {
     threadId = await this.thread(threadId, signal, "stopped");
-    const result = await this.request(
-      "stackTrace",
-      { threadId, ...(this.capabilities.supportsDelayedStackTraceLoading ? { startFrame: start, levels: count } : {}) },
-      signal,
-    );
-    const frames = this.capabilities.supportsDelayedStackTraceLoading
-      ? (result?.stackFrames ?? []).slice(0, count)
-      : (result?.stackFrames ?? []).slice(start, start + count);
-    const totalFrames =
-      result?.totalFrames ??
-      (this.capabilities.supportsDelayedStackTraceLoading ? undefined : result?.stackFrames.length);
-    const hasMore =
-      frames.length > 0 && (totalFrames === undefined ? frames.length === count : start + frames.length < totalFrames);
-    return {
-      threadId,
-      totalFrames,
-      nextStart: hasMore ? start + frames.length : undefined,
-      frames: frames.map((frame, index) => ({
-        frame: start + index,
-        name: frame.name.slice(0, 200),
-        file: frame.source?.path,
-        line: frame.line,
-        column: frame.column,
-      })),
-    };
+    const result = await this.fetchStackTrace(threadId, start, count, signal);
+    return this.formatStack(threadId, result, start, count);
   }
 
   /** 获取指定栈帧和作用域中的变量树，并应用节点、字符及深度限制。 */
@@ -341,21 +324,9 @@ export class DebugSession {
     const revision = this.revision;
     const frame = await this.frame(threadId, frameIndex, signal);
     this.checkRevision(revision);
-    const result = await this.request("scopes", { frameId: frame.id }, signal);
-    const scopes = result?.scopes ?? [];
-    const scope =
-      scopeName.toLowerCase() === "locals"
-        ? scopes.find((item) => item.presentationHint === "locals" || /^locals?$/i.test(item.name))
-        : scopes.find((item) => item.name.toLowerCase() === scopeName.toLowerCase());
-    if (!scope) {
-      throw new Error(
-        `Scope '${scopeName}' not found. Available scopes: ${scopes.map((item) => item.name).join(", ")}`,
-      );
-    }
-    const budget = { remaining: 100, characters: 12000, truncated: false };
-    const variables = await this.expand(scope.variablesReference, depth, maxChildren, budget, new Set(), signal);
+    const scope = await this.expandScope(frame.id, scopeName, depth, maxChildren, signal);
     this.checkRevision(revision);
-    return { threadId, frame: frameIndex, scope: scope.name, variables, truncated: budget.truncated };
+    return { threadId, frame: frameIndex, ...scope };
   }
 
   /** 在指定栈帧上下文中求值表达式，并限制返回文本长度。 */
@@ -385,14 +356,37 @@ export class DebugSession {
   }
 
   /** 返回同一线程的调用栈和所选栈帧变量。 */
-  async inspect(threadId?: number, frame = 0, scope = "locals", depth = 2, maxChildren = 50, signal?: AbortSignal) {
+  async inspect(
+    threadId?: number,
+    frameIndex = 0,
+    scope = "locals",
+    depth = 2,
+    maxChildren = 50,
+    signal?: AbortSignal,
+  ) {
     threadId = await this.thread(threadId, signal, "stopped");
     const revision = this.revision;
-    const stack = await this.stackTrace(threadId, 0, 20, signal);
+    // 一次 stackTrace 既用于返回展示栈，又提供接下来 expand 需要的 frameId，避免重复请求。
+    const start = 0;
+    const count = 20;
+    const result = await this.fetchStackTrace(threadId, start, count, signal);
     this.checkRevision(revision);
-    const variables = await this.variables(threadId, frame, scope, depth, maxChildren, signal);
+    const stack = this.formatStack(threadId, result, start, count);
+    // stack.frames 与 result.stackFrames 在 paged / 非 paged 两种模式下均以 start 为首元素，
+    // 目标帧 rawFrame 就是首页内相对位置；不在首页时回退到单帧拉取。
+    const rawFrame = result?.stackFrames?.[frameIndex - start];
+    const frame = rawFrame ?? (await this.frame(threadId, frameIndex, signal));
     this.checkRevision(revision);
-    return { state: this.state, reason: this.threads.get(threadId)?.details?.reason, ...stack, ...variables };
+    const variables = await this.expandScope(frame.id, scope, depth, maxChildren, signal);
+    this.checkRevision(revision);
+    return {
+      state: this.state,
+      reason: this.threads.get(threadId)?.details?.reason,
+      ...stack,
+      threadId,
+      frame: frameIndex,
+      ...variables,
+    };
   }
 
   // -- 内部：DAP 请求 -------------------------------------------------------
@@ -417,37 +411,38 @@ export class DebugSession {
     }
   }
 
-  // -- 内部：线程与栈帧 -----------------------------------------------------
+  // -- 内部：线程 -----------------------------------------------------------
 
-  private async refreshThreads(signal?: AbortSignal, retry = true): Promise<void> {
-    if (this.state === "terminated") return;
-    const revision = this.revision;
-    const result = await this.request("threads", undefined, signal);
-    if (this.isTerminated()) return;
-    // 事件与 threads 响应交错时，重取目录，避免复活已退出的线程。
-    if (revision !== this.revision) {
-      if (retry) return this.refreshThreads(signal, false);
-      throw new Error("Threads changed during discovery. Query threads again.");
-    }
-    const ids = new Set((result?.threads ?? []).map((thread) => thread.id));
-    for (const id of this.threads.keys()) {
-      if (!ids.has(id)) {
-        this.threads.delete(id);
-        this.exitedThreads.add(id);
-        this.revision++;
+  private async refreshThreads(signal?: AbortSignal): Promise<void> {
+    // 事件与 threads 响应交错时会推进 revision，最多重试一次；仍不一致则要求调用方重问。
+    for (let attempt = 0; attempt < 2; attempt++) {
+      if (this.isTerminated()) return;
+      const revision = this.revision;
+      const result = await this.request("threads", undefined, signal);
+      if (this.isTerminated()) return;
+      if (revision !== this.revision) continue;
+      const ids = new Set((result?.threads ?? []).map((thread) => thread.id));
+      for (const id of this.threads.keys()) {
+        if (!ids.has(id)) {
+          this.threads.delete(id);
+          this.exitedThreads.add(id);
+          this.revision++;
+        }
       }
+      for (const thread of result?.threads ?? []) {
+        const current = this.threads.get(thread.id);
+        this.threads.set(thread.id, {
+          ...current,
+          name: thread.name,
+          stopped: current ? current.stopped : this.defaultStopped,
+          revision: current?.revision ?? this.revision,
+        });
+        this.exitedThreads.delete(thread.id);
+      }
+      this.updateState();
+      return;
     }
-    for (const thread of result?.threads ?? []) {
-      const current = this.threads.get(thread.id);
-      this.threads.set(thread.id, {
-        ...current,
-        name: thread.name,
-        stopped: current ? current.stopped : this.defaultStopped,
-        revision: current?.revision ?? this.revision,
-      });
-      this.exitedThreads.delete(thread.id);
-    }
-    this.updateState();
+    throw new Error("Threads changed during discovery. Query threads again.");
   }
 
   private async thread(
@@ -486,6 +481,8 @@ export class DebugSession {
     return id;
   }
 
+  // -- 内部：调用栈 ---------------------------------------------------------
+
   /** 获取调用方指定索引处的单个栈帧，供变量查询和表达式求值使用。 */
   private async frame(threadId: number, index = 0, signal?: AbortSignal) {
     const paged = this.capabilities.supportsDelayedStackTraceLoading;
@@ -499,7 +496,70 @@ export class DebugSession {
     return frame;
   }
 
-  // -- 内部：状态更新 -------------------------------------------------------
+  /** 发送一次 stackTrace 请求，不对结果做展示层适配，供多个入口共享。 */
+  private fetchStackTrace(threadId: number, start: number, count: number, signal?: AbortSignal) {
+    return this.request(
+      "stackTrace",
+      { threadId, ...(this.capabilities.supportsDelayedStackTraceLoading ? { startFrame: start, levels: count } : {}) },
+      signal,
+    );
+  }
+
+  /** 将 stackTrace 响应整形为返回结构，同时处理 paged / 未 paged 分页差异。 */
+  private formatStack(
+    threadId: number,
+    result: DebugProtocol.StackTraceResponse["body"],
+    start: number,
+    count: number,
+  ) {
+    const paged = this.capabilities.supportsDelayedStackTraceLoading;
+    const frames = paged
+      ? (result?.stackFrames ?? []).slice(0, count)
+      : (result?.stackFrames ?? []).slice(start, start + count);
+    const totalFrames = result?.totalFrames ?? (paged ? undefined : result?.stackFrames.length);
+    const hasMore =
+      frames.length > 0 && (totalFrames === undefined ? frames.length === count : start + frames.length < totalFrames);
+    return {
+      threadId,
+      totalFrames,
+      nextStart: hasMore ? start + frames.length : undefined,
+      frames: frames.map((frame, index) => ({
+        frame: start + index,
+        name: frame.name.slice(0, 200),
+        file: frame.source?.path,
+        line: frame.line,
+        column: frame.column,
+      })),
+    };
+  }
+
+  // -- 内部：作用域 ---------------------------------------------------------
+
+  /** 在指定栈帧上查找作用域并递归展开；供 variables 和 inspect 共用。 */
+  private async expandScope(
+    frameId: number,
+    scopeName: string,
+    depth: number,
+    maxChildren: number,
+    signal?: AbortSignal,
+  ) {
+    const result = await this.request("scopes", { frameId }, signal);
+    const scopes = result?.scopes ?? [];
+    const scope =
+      scopeName.toLowerCase() === "locals"
+        ? scopes.find((item) => item.presentationHint === "locals" || /^locals?$/i.test(item.name))
+        : scopes.find((item) => item.name.toLowerCase() === scopeName.toLowerCase());
+    if (!scope) {
+      throw new Error(
+        `Scope '${scopeName}' not found. Available scopes: ${scopes.map((item) => item.name).join(", ")}`,
+      );
+    }
+    const budget = { remaining: 100, characters: 12000, truncated: false };
+    const variables = await this.expand(scope.variablesReference, depth, maxChildren, budget, new Set(), signal);
+    return { scope: scope.name, variables, truncated: budget.truncated };
+  }
+
+  // -- 内部：会话状态 -------------------------------------------------------
 
   private updateState(): void {
     if (this.state === "terminated") return;
@@ -509,7 +569,7 @@ export class DebugSession {
       const latest = stopped
         .filter(([, thread]) => thread.details)
         .sort(([, a], [, b]) => (b.stoppedAt ?? 0) - (a.stoppedAt ?? 0))[0];
-      this.selectedThread = latest?.[0] ?? (stopped.length === 1 ? stopped[0][0] : undefined);
+      this.selectedThread = latest?.[0];
     }
   }
 
@@ -531,7 +591,8 @@ export class DebugSession {
     this.updateState();
   }
 
-  private isTerminated(): boolean {
+  /** 抽取 state === "terminated" 判定，保留介于 await 之间仍能收窄 state 类型的能力。 */
+  private isTerminated(): this is { state: "terminated" } {
     return this.state === "terminated";
   }
 
@@ -598,15 +659,18 @@ export class DebugSession {
           this.allStopped = true;
           this.defaultStopped = true;
           this.allStoppedRevision = this.revision;
-          for (const thread of this.threads.values()) {
+          // 其它线程未在事件中被具体命名，只标记停止；保留 reason 便于 listThreads 提示，
+          // 但清掉 description/hitBreakpointIds 等只属于命名线程的 stale 字段。
+          for (const [id, thread] of this.threads) {
+            if (id === details.threadId) continue;
             thread.stopped = true;
             thread.revision = this.revision;
+            if (thread.details) thread.details = { reason: thread.details.reason };
           }
         }
         if (details.threadId !== undefined) {
-          const thread = this.threads.get(details.threadId);
           this.threads.set(details.threadId, {
-            ...thread,
+            ...this.threads.get(details.threadId),
             stopped: true,
             details,
             revision: this.revision,
@@ -647,19 +711,11 @@ export class DebugSession {
         break;
       }
       case "terminated":
-        this.state = "terminated";
-        this.revision++;
-        this.selectedThread = undefined;
-        this.threads.clear();
-        this.allStopped = false;
-        this.defaultStopped = undefined;
+        this.markTerminated();
         // terminated 结束调试会话，但 Adapter 可能仍在等待 disconnect 才会退出。
         void this.close(false).catch((error) => {
           this.failure = error instanceof Error ? error.message : String(error);
         });
-        break;
-      case "invalidated":
-        this.revision++;
         break;
       case "exited":
         this.exitCode = (event.body as DebugProtocol.ExitedEvent["body"]).exitCode;
