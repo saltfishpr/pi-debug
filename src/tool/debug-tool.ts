@@ -6,14 +6,24 @@ export function registerDebugTool(pi: ExtensionAPI, manager: DebugSessionManager
   pi.registerTool({
     name: "debug",
     label: "Debug",
-    description:
-      "Debug Go programs with Delve over DAP; dlv must be on PATH. Python is not implemented. configurations lists project launch.json entries; start accepts a name or inline Go configuration. Include breakpoints in start before execution. Launch pauses on entry by default. set_breakpoints replaces all breakpoints in one file. inspect returns stack and locals. frame is a zero-based index, not a DAP ID. Execution actions wait up to waitMs then return current state; use wait/status if still running. stop terminates launched programs and detaches attached programs. One session at a time; use stop before starting another.",
-    promptSnippet: "Debug Go programs using breakpoints, runtime inspection, and stepping",
+    description: [
+      "Debug applications with breakpoints, stepping, and runtime inspection.",
+      "`configurations` lists project debug configurations; `start` launches or attaches using a configuration name or inline configuration.",
+      "Launch pauses on entry by default.",
+      "`set_breakpoints` replaces all breakpoints in a file; an empty lines array clears them.",
+      "`inspect` returns the call stack and variables for the selected frame.",
+      "Runtime inspection requires a stopped program.",
+      "Execution actions may return while the program is still running; use `wait` to await a stop or `status` to check current state.",
+      "`stop` terminates launched programs and detaches from attached programs.",
+      "Only one debug session can exist at a time; call `stop` before starting another, even after the program exits.",
+      "Debug sessions do not survive reloads or Pi session changes.",
+    ].join(" "),
+    promptSnippet: "Inspect runtime state and trace execution to diagnose application behavior",
     promptGuidelines: [
-      "Use debug to inspect runtime state instead of guessing; read source and set focused breakpoints before running.",
-      "After debug reports a stop, use inspect before stepping. Avoid repeatedly stepping through large loops.",
-      "Use debug evaluate only for focused expressions; evaluation can have side effects even in watch context.",
-      "Use debug stop when investigation is complete. Debug sessions are not restored after reload or session changes.",
+      "Use debug when runtime evidence is needed to test a hypothesis about application behavior. Read the relevant source first and choose breakpoints that distinguish likely causes; include initial breakpoints in `start`.",
+      "When debug reports a stop, use `inspect` to orient yourself, then request only the frames, variables, or expressions needed to test the hypothesis. Prefer targeted breakpoints over repeated stepping through loops.",
+      "Treat debug `evaluate` as code execution: expressions may call functions or mutate program state. Prefer read-only expressions unless side effects are intentional.",
+      "Call debug `stop` when the investigation is complete to release the session and its resources.",
     ],
     parameters: debugParameters,
     async execute(_id, args, signal, _onUpdate, ctx) {

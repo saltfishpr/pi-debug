@@ -32,7 +32,11 @@ export const debugParameters = Type.Object(
       Type.Union([
         Type.String({ minLength: 1, description: "Configuration name from launch.json." }),
         Type.Object(
-          { name: Type.String(), type: Type.String(), request: StringEnum(["launch", "attach"] as const) },
+          {
+            name: Type.String(),
+            type: Type.String(),
+            request: StringEnum(["launch", "attach"] as const),
+          },
           { additionalProperties: true },
         ),
       ]),
@@ -54,9 +58,7 @@ export const debugParameters = Type.Object(
     ),
 
     // 栈帧与作用域选择
-    frame: Type.Optional(
-      Type.Integer({ minimum: 0, maximum: 999, description: "Zero-based stack frame index; default 0." }),
-    ),
+    frame: Type.Optional(Type.Integer({ minimum: 0, maximum: 999, description: "Zero-based stack frame index; default 0." })),
     scope: Type.Optional(Type.String({ minLength: 1, description: "Scope name or locals (default)." })),
 
     // 变量展开限制
