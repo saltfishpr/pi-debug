@@ -4,6 +4,7 @@ import { createConnection } from "node:net";
 import type { Readable, Writable } from "node:stream";
 import { finished } from "node:stream/promises";
 import { setTimeout as delay } from "node:timers/promises";
+import { AsyncDisposableStore } from "../common/lifecycle.js";
 import { asError, ConnectionClosedError } from "./errors.js";
 
 /**
@@ -38,19 +39,30 @@ export interface TransportHandlers {
  * `close` 中 destroy 并等待 finish。
  */
 export class StreamTransport implements DapTransport {
-  private handlers: TransportHandlers | undefined;
-  private ended = false;
-  // 处于 in-flight 的 `write` 调用数，用于决定何时可以安全解除 error 监听。
-  private pendingWrites = 0;
-  // 关闭信号，用于中止仍在等待写回调的 `write` promise。
+  private readonly resources = new AsyncDisposableStore();
+  /** 用于中止仍在等待写入回调的 Promise 的关闭信号。 */
   private readonly shutdown = new AbortController();
 
-  constructor(
-    private readonly readable: Readable,
-    private readonly writable: Writable,
-    private readonly ownsStreams = false,
-  ) {}
+  /** 由 open 注册的上层事件回调。 */
+  private handlers: TransportHandlers | undefined;
+  /** 标记 transport 是否已经结束，避免重复上报关闭事件。 */
+  private ended = false;
 
+  /** 处于 in-flight 的写入数，用于决定何时能安全解除 error 监听。 */
+  private pendingWrites = 0;
+
+  constructor(
+    /** 提供 Adapter 输出字节的输入流。 */
+    private readonly readable: Readable,
+    /** 接收 DAP 帧字节的输出流。 */
+    private readonly writable: Writable,
+    /** 标记关闭时是否应销毁传入的流。 */
+    private readonly ownsStreams = false,
+  ) {
+    this.resources.add({ dispose: () => this.release() });
+  }
+
+  /** 注册流事件并开始向上层转发输入字节。 */
   async open(handlers: TransportHandlers): Promise<void> {
     if (this.handlers || this.ended) throw new ConnectionClosedError("Transport cannot be reopened");
     if (
@@ -76,6 +88,7 @@ export class StreamTransport implements DapTransport {
     this.readable.on("data", this.onData);
   }
 
+  /** 向输出流写入一帧 DAP 字节，并等待写入回调。 */
   write(data: Buffer): Promise<void> {
     if (!this.handlers || this.ended) return Promise.reject(new ConnectionClosedError("Transport is not open"));
     // 上层 client 已经串行化写入并对队列做了限制。等待 write 回调也能自然处理
@@ -99,9 +112,15 @@ export class StreamTransport implements DapTransport {
     });
   }
 
-  async close(): Promise<void> {
+  /** 中止读写并释放流事件监听器及自有流。 */
+  close(): Promise<void> {
     this.ended = true;
     this.shutdown.abort();
+    return this.resources.dispose();
+  }
+
+  /** 解除监听器；自有流还会等待销毁完成。 */
+  private async release(): Promise<void> {
     this.readable.pause();
     this.readable.off("data", this.onData);
     this.readable.off("end", this.onEnd);
@@ -135,8 +154,11 @@ export class StreamTransport implements DapTransport {
     });
   }
 
+  /** 将输入流字节转发给当前 handlers。 */
   private readonly onData = (data: Buffer): void => this.handlers?.onData(data);
+  /** 将流错误收敛为 transport 关闭。 */
   private readonly onError = (error: Error): void => this.finish(error);
+  /** 将流结束或关闭收敛为 transport 关闭。 */
   private readonly onEnd = (): void => this.finish();
 
   /** 唯一的关闭汇聚点：向上通知一次 onClose，并翻转内部状态。 */
@@ -150,28 +172,31 @@ export class StreamTransport implements DapTransport {
 
 /** 主动连接一个已在监听的 TCP DAP 端口。不负责启动 server 进程。 */
 export class TcpTransport implements DapTransport {
+  private readonly resources = new AsyncDisposableStore();
   private stream: StreamTransport | undefined;
-  private closed = false;
 
   constructor(private readonly options: { port: number; host?: string }) {
     validatePort(options.port);
+    this.resources.add({ dispose: () => this.stream?.close() });
   }
 
+  /** 建立 TCP 连接并委托流 transport 处理读写。 */
   async open(handlers: TransportHandlers): Promise<void> {
-    if (this.stream || this.closed) throw new ConnectionClosedError("Transport cannot be reopened");
+    if (this.stream || this.resources.isDisposed) throw new ConnectionClosedError("Transport cannot be reopened");
     const socket = createConnection({ port: this.options.port, host: this.options.host ?? "127.0.0.1" });
     socket.setNoDelay(true);
     this.stream = new StreamTransport(socket, socket, true);
     await Promise.all([ready(socket, "connect"), this.stream.open(handlers)]);
   }
 
+  /** 通过已建立的 TCP 连接写入 DAP 帧。 */
   write(data: Buffer): Promise<void> {
     return this.stream?.write(data) ?? Promise.reject(new ConnectionClosedError("Transport is not open"));
   }
 
-  async close(): Promise<void> {
-    this.closed = true;
-    await this.stream?.close();
+  /** 关闭已建立的 TCP 连接。 */
+  close(): Promise<void> {
+    return this.resources.dispose();
   }
 }
 
@@ -196,25 +221,29 @@ export interface ProcessOptions {
 export class StdioTransport implements DapTransport {
   private process: AdapterProcess | undefined;
   private stream: StreamTransport | undefined;
-  private closed = false;
+  private readonly resources = new AsyncDisposableStore();
 
-  constructor(private readonly options: ProcessOptions) {}
+  constructor(private readonly options: ProcessOptions) {
+    this.resources.add({ dispose: () => this.process?.stop() });
+    this.resources.add({ dispose: () => this.stream?.close() });
+  }
 
+  /** 启动 Adapter 子进程并连接其标准输入输出流。 */
   async open(handlers: TransportHandlers): Promise<void> {
-    if (this.process || this.closed) throw new ConnectionClosedError("Transport cannot be reopened");
+    if (this.process || this.resources.isDisposed) throw new ConnectionClosedError("Transport cannot be reopened");
     this.process = new AdapterProcess(this.options, handlers);
     this.stream = new StreamTransport(this.process.child.stdout!, this.process.child.stdin!, true);
     await Promise.all([this.process.ready, this.stream.open(handlers)]);
   }
 
+  /** 通过 Adapter 的标准输入写入 DAP 帧。 */
   write(data: Buffer): Promise<void> {
     return this.stream?.write(data) ?? Promise.reject(new ConnectionClosedError("Transport is not open"));
   }
 
-  async close(): Promise<void> {
-    this.closed = true;
-    await this.process?.stop();
-    await this.stream?.close();
+  /** 依次停止 Adapter 并关闭其通信流。 */
+  close(): Promise<void> {
+    return this.resources.dispose();
   }
 }
 
@@ -234,19 +263,25 @@ export interface ServerOptions extends ProcessOptions {
  * 同时拥有 Adapter 进程和 socket 的生命周期。
  */
 export class SpawnedServerTransport implements DapTransport {
-  private readonly retryInterval: number;
-  // 用于在关闭时中止 spawn 与重试连接的整体控制器。
+  private readonly resources = new AsyncDisposableStore();
+  /** 用于在关闭时中止 spawn 与重试连接的整体控制器。 */
   private readonly lifetime = new AbortController();
+
+  private readonly retryInterval: number;
   private process: AdapterProcess | undefined;
   private socket: TcpTransport | undefined;
-  // 首次 TCP 连接建立成功后才转发 onClose；否则 socket 的关闭属于重试语义。
+  /** 标记首次 TCP 连接是否成功，成功前的 socket 关闭仅表示重试。 */
   private connected = false;
 
   constructor(private readonly options: ServerOptions) {
     validatePort(options.port);
     this.retryInterval = options.retryIntervalMs ?? 50;
+    // 连接清理失败也不能跳过进程清理。
+    this.resources.add({ dispose: () => this.socket?.close() });
+    this.resources.add({ dispose: () => this.process?.stop() });
   }
 
+  /** 启动 server Adapter，循环连接其 TCP 端口直至成功或被中止。 */
   async open(handlers: TransportHandlers): Promise<void> {
     if (this.process || this.lifetime.signal.aborted) throw new ConnectionClosedError("Transport cannot be reopened");
     this.process = new AdapterProcess(this.options, {
@@ -288,15 +323,15 @@ export class SpawnedServerTransport implements DapTransport {
     this.lifetime.signal.throwIfAborted();
   }
 
+  /** 通过已建立的 server TCP 连接写入 DAP 帧。 */
   write(data: Buffer): Promise<void> {
     return this.socket?.write(data) ?? Promise.reject(new ConnectionClosedError("Server is not connected"));
   }
 
-  async close(): Promise<void> {
+  /** 中止重试连接并依次关闭 socket 与 Adapter 进程。 */
+  close(): Promise<void> {
     this.lifetime.abort(new ConnectionClosedError("Server transport closed"));
-    // 先关闭 socket，再停 Adapter 进程，避免半死的 server 持有资源。
-    await this.socket?.close();
-    await this.process?.stop();
+    return this.resources.dispose();
   }
 }
 
@@ -305,12 +340,17 @@ export class SpawnedServerTransport implements DapTransport {
  * 负责把 spawn 错误、进程退出、stderr 数据都转成 handlers 回调。
  */
 class AdapterProcess {
+  private readonly resources = new AsyncDisposableStore();
+
+  /** 被包装的 Adapter 子进程。 */
   readonly child: ChildProcess;
-  /** Adapter 进程完成 spawn（拿到 pid）后 resolve。 */
-  readonly ready: Promise<void>;
-  // 进程 close 事件的 promise，用于 stop 时等待真正退出。
-  private readonly exited: Promise<void>;
+  /** 发送 SIGTERM 后等待进程自行退出的最长时间。 */
   private readonly shutdownTimeout: number;
+
+  /** Adapter 进程完成 spawn（拿到 pid）后兑现。 */
+  readonly ready: Promise<void>;
+  /** 进程触发 close 事件后兑现，供终止流程等待实际退出。 */
+  private readonly exited: Promise<void>;
 
   constructor(options: ProcessOptions, handlers: TransportHandlers) {
     this.shutdownTimeout = options.shutdownTimeoutMs ?? 1000;
@@ -318,6 +358,14 @@ class AdapterProcess {
     if (options.cwd !== undefined) spawnOptions.cwd = options.cwd;
     if (options.env !== undefined) spawnOptions.env = options.env;
     this.child = spawn(options.command, [...(options.args ?? [])], spawnOptions);
+    this.resources.add({ dispose: () => this.terminate() });
+    for (const stream of [this.child.stdin, this.child.stdout, this.child.stderr]) {
+      this.resources.add({
+        dispose: () => {
+          stream?.destroy();
+        },
+      });
+    }
     this.ready = ready(this.child, "spawn");
     this.exited = new Promise<void>((resolve) =>
       this.child.once("close", (code, signal) => {
@@ -333,7 +381,12 @@ class AdapterProcess {
   }
 
   /** 优雅停止 Adapter：先 SIGTERM 等一段时间，超时再 SIGKILL，最后 destroy stdio。 */
-  async stop(): Promise<void> {
+  stop(): Promise<void> {
+    return this.resources.dispose();
+  }
+
+  /** 终止仍在运行的 Adapter 进程，超时后升级为 SIGKILL。 */
+  private async terminate(): Promise<void> {
     if (this.child.exitCode === null && this.child.signalCode === null) {
       this.child.kill("SIGTERM");
       let timer: ReturnType<typeof setTimeout> | undefined;
@@ -348,9 +401,6 @@ class AdapterProcess {
       ]).finally(() => clearTimeout(timer));
       await this.exited;
     }
-    this.child.stdin?.destroy();
-    this.child.stdout?.destroy();
-    this.child.stderr?.destroy();
   }
 }
 

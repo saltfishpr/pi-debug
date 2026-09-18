@@ -1,6 +1,7 @@
 import type { DebugProtocol } from "@vscode/debugprotocol";
 import { EventEmitter } from "node:events";
 import { setImmediate as nextTurn } from "node:timers/promises";
+import { AsyncDisposableStore } from "../common/lifecycle.js";
 import { encodeMessage, MessageDecoder, type CodecOptions, type Message } from "./codec.js";
 import {
   asError,
@@ -39,40 +40,50 @@ interface PendingRequest {
  * 以及并发和超时控制。会话状态（capabilities 协商、breakpoints 缓存等）由调用方维护。
  */
 export class DapClient {
-  private readonly events = new EventEmitter();
+  private readonly resources = new AsyncDisposableStore();
+  /** 整个 client 生命周期的 abort 源，close/fail 时统一触发。 */
+  private readonly lifetime = new AbortController();
+
+  /** 将 transport 的字节流还原为 DAP 消息。 */
   private readonly decoder: MessageDecoder;
+  /** 单个请求默认允许的最长执行时间。 */
   private readonly requestTimeout: number;
+  /** 建立 transport 连接默认允许的最长时间。 */
   private readonly connectTimeout: number;
+  /** 同时允许未完成的正向和反向请求总量上限。 */
   private readonly maxPending: number;
+  /** 出站写入队列累计字节数上限。 */
   private readonly maxQueuedBytes: number;
+  /** 连接状态机；一旦进入 closed 就不再流转。 */
+  private state: "new" | "connecting" | "open" | "closed" = "new";
 
   /** 未完成的正向请求：seq → 请求条目。 */
   private readonly pending = new Map<number, PendingRequest>();
   /** 已注册的反向请求处理器：command → handler。 */
   private readonly reverseHandlers = new Map<string, ReverseRequestHandler>();
-  /** 整个 client 生命周期的 abort 源，close/fail 时统一触发。 */
-  private readonly lifetime = new AbortController();
-  /** 连接状态机；一旦进入 closed 就不再流转。 */
-  private state: "new" | "connecting" | "open" | "closed" = "new";
-  /** 下一次发出的消息 seq。 */
-  private sequence = 1;
+
+  /** 向调用方分发 DAP 事件、连接关闭和 Adapter 输出。 */
+  private readonly events = new EventEmitter();
   /** 出站写入串行化的尾部 promise，保证 transport.write 按序执行。 */
   private outgoing = Promise.resolve();
   /** 入站消息分发的串行化尾部 promise，保持消息按到达顺序处理。 */
   private incoming = Promise.resolve();
+
+  /** 下一次发出的消息 seq。 */
+  private sequence = 1;
   /** 当前出站队列累计字节数，与 maxQueuedBytes 对比背压。 */
   private queuedBytes = 0;
   /** 已解码但尚未 dispatch 的消息数，与 maxPending 对比防止分发积压。 */
   private queuedMessages = 0;
   /** 正在执行的反向请求数，与 maxPending 对比防止 handler 积压。 */
   private reverseRequests = 0;
-  /** 关闭流程的 promise，作为 close() 的幂等结果。 */
-  private closing: Promise<void> | undefined;
 
   constructor(
+    /** 承载 DAP 字节读写的底层连接。 */
     private readonly transport: DapTransport,
     options: DapClientOptions = {},
   ) {
+    this.resources.add({ dispose: () => this.transport.close() });
     this.decoder = new MessageDecoder(options.codec);
     this.requestTimeout = options.requestTimeoutMs ?? 30_000;
     this.connectTimeout = options.connectTimeoutMs ?? 10_000;
@@ -122,8 +133,8 @@ export class DapClient {
 
   /** 关闭 transport 并释放资源。发起调试会话结束前应先发 `disconnect` 请求。 */
   close(): Promise<void> {
-    if (!this.closing) this.fail(new ConnectionClosedError("DAP client closed"));
-    return this.closing!;
+    this.fail(new ConnectionClosedError("DAP client closed"));
+    return this.resources.dispose();
   }
 
   // -- 请求收发 ---------------------------------------------------------------
@@ -211,10 +222,9 @@ export class DapClient {
   private fail(error: Error): void {
     if (this.state === "closed") return;
     this.state = "closed";
-    this.closing = Promise.resolve().then(() => this.transport.close());
     // 自动清理不能产生 unhandledRejection；显式 close() 仍会拿到原始的 promise
     // 以便观察 transport.close 的失败。
-    void this.closing.catch(() => {});
+    void this.resources.dispose().catch(() => {});
     this.lifetime.abort(error);
     for (const request of this.pending.values()) request.reject(error);
     this.pending.clear();

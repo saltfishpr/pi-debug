@@ -1,6 +1,7 @@
 import type { DebugProtocol } from "@vscode/debugprotocol";
 import { EventEmitter } from "node:events";
 import { resolve } from "node:path";
+import { AsyncDisposableStore } from "../common/lifecycle.js";
 import { DapClient, type DapRequests } from "../dap/index.js";
 import { TerminalProcesses } from "./terminal-processes.js";
 
@@ -40,18 +41,11 @@ interface ThreadRecord {
 
 /** 维护单个事件驱动的 DAP 会话，并封装不会向外泄漏的帧与变量引用。 */
 export class DebugSession {
-  /** 会话工作目录，用于把调用方传入的相对路径解析为绝对路径。 */
-  readonly workspaceFolder: string;
-  /** 与 Debug Adapter 通信的 DAP 客户端。 */
-  private readonly client: DapClient;
-  /** 会话的启动模式，决定启动请求及关闭时是否终止被调试进程。 */
-  private readonly launchCommand: "launch" | "attach";
-  /** initialize 请求中声明的 Debug Adapter 标识。 */
-  private readonly adapterID: string;
-  /** Adapter 声明及后续动态更新的能力集合。 */
-  private capabilities: DebugProtocol.Capabilities = {};
-
-  // -- 生命周期与通知 ----------------------------------------------------------
+  private readonly resources = new AsyncDisposableStore();
+  /** 处理 Adapter 发起的 runInTerminal 请求所创建的进程。 */
+  private readonly terminalProcesses: TerminalProcesses;
+  /** 会话状态变化通知器，供异步等待逻辑订阅。 */
+  private readonly changes = new EventEmitter();
 
   /** 当前调试会话状态。 */
   private state: "starting" | "running" | "stopped" | "terminated" = "starting";
@@ -61,11 +55,8 @@ export class DebugSession {
   private failure: string | undefined;
   /** 被调试进程通过 exited 事件报告的退出码。 */
   private exitCode: number | undefined;
-  /** 共享的关闭流程 Promise，用于保证 close 幂等。 */
-  private closing: Promise<void> | undefined;
-  private readonly terminalProcesses: TerminalProcesses;
-  /** 会话状态变化通知器，供异步等待逻辑订阅。 */
-  private readonly changes = new EventEmitter();
+  /** Adapter 声明及后续动态更新的能力集合。 */
+  private capabilities: DebugProtocol.Capabilities = {};
 
   // -- 线程状态与事件顺序 ------------------------------------------------------
 
@@ -95,12 +86,16 @@ export class DebugSession {
   /** 标记当前缓存的 Adapter 输出是否因长度限制被截断。 */
   private outputTruncated = false;
 
-  /** 创建会话并注册 DAP 事件、Adapter 输出和连接关闭监听器。 */
-  constructor(workspaceFolder: string, client: DapClient, launchCommand: "launch" | "attach", adapterID: string) {
-    this.workspaceFolder = workspaceFolder;
-    this.client = client;
-    this.launchCommand = launchCommand;
-    this.adapterID = adapterID;
+  constructor(
+    /** 会话工作目录，用于把调用方传入的相对路径解析为绝对路径。 */
+    readonly workspaceFolder: string,
+    /** 与 Debug Adapter 通信的 DAP 客户端。 */
+    private readonly client: DapClient,
+    /** 会话的启动模式，决定启动请求及关闭时是否终止被调试进程。 */
+    private readonly launchCommand: "launch" | "attach",
+    /** initialize 请求中声明的 Debug Adapter 标识。 */
+    private readonly adapterID: string,
+  ) {
     this.terminalProcesses = new TerminalProcesses(workspaceFolder, (text) => this.appendOutput(text));
     client.onEvent((event) => this.onEvent(event));
     client.onOutput("stderr", (data) => this.appendOutput(data.toString("utf8")));
@@ -113,7 +108,8 @@ export class DebugSession {
       });
     });
     client.onReverseRequest("runInTerminal", (request, signal) => {
-      if (this.closing || this.state === "terminated") throw new Error("Debug session is closing or terminated.");
+      if (this.resources.isDisposed || this.state === "terminated")
+        throw new Error("Debug session is closing or terminated.");
       return this.terminalProcesses.run(request.arguments, signal);
     });
   }
@@ -194,25 +190,25 @@ export class DebugSession {
   /** 幂等断开 DAP 会话并释放底层客户端资源。 */
   close(terminateDebuggee?: boolean): Promise<void> {
     terminateDebuggee ??= this.launchCommand === "launch";
-    this.closing ??= (async () => {
-      try {
-        await this.client.request(
-          "disconnect",
-          this.capabilities.supportTerminateDebuggee ? { terminateDebuggee } : {},
-          { timeoutMs: 3000 },
-        );
-      } catch {
-        // Adapter 失败或断开连接时，仍须继续清理底层 transport。
-      } finally {
-        this.markTerminated();
-        try {
-          await this.client.close();
-        } finally {
-          await this.terminalProcesses.close();
-        }
-      }
-    })();
-    return this.closing;
+    if (!this.resources.isDisposed) {
+      this.resources.add({
+        dispose: async () => {
+          try {
+            await this.client.request(
+              "disconnect",
+              this.capabilities.supportTerminateDebuggee ? { terminateDebuggee } : {},
+              { timeoutMs: 3000 },
+            );
+          } catch {
+            // Adapter 已断开时仍须释放本地资源。
+          }
+        },
+      });
+      this.resources.add({ dispose: () => this.markTerminated() });
+      this.resources.add({ dispose: () => this.client.close() });
+      this.resources.add({ dispose: () => this.terminalProcesses.close() });
+    }
+    return this.resources.dispose();
   }
 
   // -- 会话状态查询 ---------------------------------------------------------
@@ -419,6 +415,7 @@ export class DebugSession {
     return response.body as DapRequests[K][1]["body"];
   }
 
+  /** 确认查询期间执行状态未变化，防止返回过期的帧或变量。 */
   private checkRevision(revision: number): void {
     if (revision !== this.revision || this.state === "terminated") {
       throw new Error(
@@ -429,6 +426,7 @@ export class DebugSession {
 
   // -- 内部：线程 -----------------------------------------------------------
 
+  /** 刷新线程目录，并在事件竞争时最多重试一次以获得一致快照。 */
   private async refreshThreads(signal?: AbortSignal): Promise<void> {
     // 事件与 threads 响应交错时会推进 revision，最多重试一次；仍不一致则要求调用方重问。
     for (let attempt = 0; attempt < 2; attempt++) {
@@ -461,6 +459,7 @@ export class DebugSession {
     throw new Error("Threads changed during discovery. Query threads again.");
   }
 
+  /** 解析目标线程，并校验它在当前会话中存在且满足运行状态要求。 */
   private async thread(
     id: number | undefined,
     signal?: AbortSignal,
@@ -577,6 +576,7 @@ export class DebugSession {
 
   // -- 内部：会话状态 -------------------------------------------------------
 
+  /** 根据已知线程停止状态更新会话状态与默认选中线程。 */
   private updateState(): void {
     if (this.state === "terminated") return;
     const stopped = [...this.threads].filter(([, thread]) => thread.stopped);
@@ -589,6 +589,7 @@ export class DebugSession {
     }
   }
 
+  /** 应用线程或全体线程继续执行的状态变化，不覆盖较新的停止事件。 */
   private continued(threadId: number, all: boolean, before = Infinity): void {
     if (this.allStoppedRevision <= before) {
       this.allStopped = false;
@@ -795,6 +796,7 @@ export class DebugSession {
     });
   }
 
+  /** 等待目标线程或整个会话停止、终止，或到达超时。 */
   private async waitForStop(threadId: number | undefined, timeout: number, signal?: AbortSignal, after?: number) {
     const outcome = () => {
       if (this.state === "terminated") return "terminated";

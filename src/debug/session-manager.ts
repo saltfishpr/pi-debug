@@ -1,4 +1,5 @@
 import { getDebugAdapterProvider } from "../adapters/index.js";
+import { AsyncDisposableStore } from "../common/lifecycle.js";
 import { loadDebugConfigurations } from "../config/launch-config.js";
 import { DapClient, RequestTimeoutError } from "../dap/index.js";
 import type { DebugArguments } from "../tool/schema.js";
@@ -6,12 +7,23 @@ import { DebugSession } from "./session.js";
 
 /** 管理单个活动调试会话，并串行执行工具调用以避免执行状态相互覆盖。 */
 export class DebugSessionManager {
+  private readonly resources = new AsyncDisposableStore();
   /** 管理器生命周期的取消源，用于在关闭时中止当前及后续操作。 */
   private readonly lifetime = new AbortController();
+
   /** 当前活动的调试会话；未启动或已终止时为空。 */
   private session: DebugSession | undefined;
   /** 工具调用队列的尾部 Promise，用于保证调试操作按提交顺序执行。 */
   private pending: Promise<unknown> = Promise.resolve();
+
+  constructor() {
+    this.resources.add({
+      dispose: async () => {
+        await this.pending;
+      },
+    });
+    this.resources.add({ dispose: () => this.closeSession() });
+  }
 
   /** 将一次工具调用加入串行队列，并统一处理取消、超时与会话失效。 */
   execute(args: DebugArguments, cwd: string, signal?: AbortSignal): Promise<unknown> {
@@ -23,8 +35,7 @@ export class DebugSessionManager {
       } catch (error) {
         // 已取消或超时的请求可能已经改变被调试进程，关闭会话以免暴露过期的停止状态。
         if (combined.aborted || error instanceof RequestTimeoutError) {
-          await this.session?.close();
-          this.session = undefined;
+          await this.closeSession();
         }
         throw error;
       }
@@ -34,11 +45,16 @@ export class DebugSessionManager {
   }
 
   /** 终止管理器生命周期，等待队列清空，并释放当前调试会话。 */
-  async close(): Promise<void> {
+  close(): Promise<void> {
     this.lifetime.abort(new Error("Pi session ended."));
-    await this.pending;
-    await this.session?.close();
+    return this.resources.dispose();
+  }
+
+  /** 从管理器摘除并关闭当前会话，避免并发调用复用已关闭实例。 */
+  private async closeSession(): Promise<void> {
+    const session = this.session;
     this.session = undefined;
+    await session?.close();
   }
 
   /** 根据 action 校验参数并将调用分派给配置加载器、Adapter Provider 或活动会话。 */
@@ -49,10 +65,9 @@ export class DebugSessionManager {
       case "start":
         return this.start(args, cwd, signal);
       case "stop": {
-        await this.session?.close();
-        const result = this.session?.snapshot() ?? { state: "terminated" };
-        this.session = undefined;
-        return result;
+        const session = this.session;
+        await this.closeSession();
+        return session?.snapshot() ?? { state: "terminated" };
       }
       case "status":
         return this.session?.snapshot() ?? { state: "idle" };
@@ -124,6 +139,7 @@ export class DebugSessionManager {
     }
   }
 
+  /** 返回当前活动会话；不存在时给出下一步操作提示。 */
   private requireSession(): DebugSession {
     if (!this.session) throw new Error("No debug session. Use debug start first.");
     return this.session;
