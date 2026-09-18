@@ -2,6 +2,7 @@ import type { DebugProtocol } from "@vscode/debugprotocol";
 import { EventEmitter } from "node:events";
 import { resolve } from "node:path";
 import { DapClient, type DapRequests } from "../dap/index.js";
+import { TerminalProcesses } from "./terminal-processes.js";
 
 /** 描述返回给调用方的单个变量及其按需展开的子变量。 */
 interface VariableView {
@@ -62,6 +63,7 @@ export class DebugSession {
   private exitCode: number | undefined;
   /** 共享的关闭流程 Promise，用于保证 close 幂等。 */
   private closing: Promise<void> | undefined;
+  private readonly terminalProcesses: TerminalProcesses;
   /** 会话状态变化通知器，供异步等待逻辑订阅。 */
   private readonly changes = new EventEmitter();
 
@@ -99,12 +101,20 @@ export class DebugSession {
     this.client = client;
     this.launchCommand = launchCommand;
     this.adapterID = adapterID;
+    this.terminalProcesses = new TerminalProcesses(workspaceFolder, (text) => this.appendOutput(text));
     client.onEvent((event) => this.onEvent(event));
     client.onOutput("stderr", (data) => this.appendOutput(data.toString("utf8")));
     client.onOutput("stdout", (data) => this.appendOutput(data.toString("utf8")));
     client.onClose((error) => {
       if (this.state !== "terminated") this.failure = error.message;
       this.markTerminated();
+      void this.close().catch((cause) => {
+        this.failure = cause instanceof Error ? cause.message : String(cause);
+      });
+    });
+    client.onReverseRequest("runInTerminal", (request, signal) => {
+      if (this.closing || this.state === "terminated") throw new Error("Debug session is closing or terminated.");
+      return this.terminalProcesses.run(request.arguments, signal);
     });
   }
 
@@ -141,9 +151,11 @@ export class DebugSession {
             pathFormat: "path",
             linesStartAt1: true,
             columnsStartAt1: true,
-            supportsRunInTerminalRequest: false,
-            supportsStartDebuggingRequest: false,
             supportsVariableType: true,
+            supportsVariablePaging: true,
+            supportsInvalidatedEvent: true,
+            supportsRunInTerminalRequest: true,
+            supportsStartDebuggingRequest: false,
           },
           signal,
         )) ?? {};
@@ -193,7 +205,11 @@ export class DebugSession {
         // Adapter 失败或断开连接时，仍须继续清理底层 transport。
       } finally {
         this.markTerminated();
-        await this.client.close();
+        try {
+          await this.client.close();
+        } finally {
+          await this.terminalProcesses.close();
+        }
       }
     })();
     return this.closing;
@@ -608,9 +624,19 @@ export class DebugSession {
     signal?: AbortSignal,
   ): Promise<VariableView[]> {
     if (!reference || depth === 0 || ancestors.has(reference)) return [];
-    const result = await this.request("variables", { variablesReference: reference }, signal);
+    const limit = Math.min(maxChildren, budget.remaining);
+    // 多取一个元素即可判断是否仍有子项，同时避免 Adapter 构造不会进入结果的大型变量列表。
+    const result = await this.request(
+      "variables",
+      {
+        variablesReference: reference,
+        start: 0,
+        count: limit + 1,
+      },
+      signal,
+    );
     const all = result?.variables ?? [];
-    const selected = all.slice(0, Math.min(maxChildren, budget.remaining));
+    const selected = all.slice(0, limit);
     if (selected.length < all.length) budget.truncated = true;
     budget.remaining -= selected.length;
     const path = new Set(ancestors).add(reference);
@@ -686,8 +712,8 @@ export class DebugSession {
         if (this.state === "terminated") break;
         this.revision++;
         const body = event.body as DebugProtocol.ContinuedEvent["body"];
-        this.continued(body.threadId, body.allThreadsContinued !== false);
-        if (body.allThreadsContinued !== false) this.allContinuedRevision = this.revision;
+        this.continued(body.threadId, body.allThreadsContinued === true);
+        if (body.allThreadsContinued === true) this.allContinuedRevision = this.revision;
         else {
           const thread = this.threads.get(body.threadId);
           if (thread) thread.continuedRevision = this.revision;
@@ -725,6 +751,10 @@ export class DebugSession {
         break;
       case "capabilities":
         Object.assign(this.capabilities, (event.body as DebugProtocol.CapabilitiesEvent["body"]).capabilities);
+        break;
+      case "invalidated":
+        // 本会话不缓存栈帧或变量；推进 revision 即可使正在读取的旧快照失败，后续查询会重新拉取。
+        if (this.state !== "terminated") this.revision++;
         break;
     }
     this.changes.emit("change");
