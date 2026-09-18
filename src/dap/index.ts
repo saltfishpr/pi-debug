@@ -23,6 +23,7 @@ export {
   ProtocolError,
   RequestAbortedError,
   RequestTimeoutError,
+  UnsupportedCapabilityError,
 } from "./errors.js";
 
 // Transport 实现与配置
