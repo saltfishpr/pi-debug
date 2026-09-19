@@ -1,4 +1,4 @@
-import type { DebugAdapterProvider } from "./provider.js";
+import type { DebugAdapterProvider } from "./index.js";
 
 /** Python launch and TCP attach through debugpy. */
 export const pythonProvider: DebugAdapterProvider = {
