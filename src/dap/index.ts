@@ -12,12 +12,4 @@ export {
   StreamDebugAdapter,
 } from "./debug-adapter.js";
 export type { NamedPipeOptions, ProcessOptions, SocketOptions, SpawnedServerOptions } from "./debug-adapter.js";
-export type {
-  DapRequest,
-  DapRequestArguments,
-  DapRequestCommand,
-  DapRequestMap,
-  DapResponse,
-  DebugAdapter,
-  Event,
-} from "./types.js";
+export type { DapRequestMap, DebugAdapter, Event } from "./types.js";

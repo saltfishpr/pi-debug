@@ -1,7 +1,7 @@
 import { createServer } from "node:net";
 import { resolve } from "node:path";
 import { z } from "zod";
-import { SocketDebugAdapter, SpawnedServerDebugAdapter } from "../dap/index.js";
+import { SocketDebugAdapter, SpawnedServerDebugAdapter } from "../dap";
 import type { DebugAdapterProvider } from "./index.js";
 
 const goConfigurationSchema = z

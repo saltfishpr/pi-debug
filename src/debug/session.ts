@@ -2,7 +2,7 @@ import type { DebugProtocol } from "@vscode/debugprotocol";
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import type { DebugConfiguration } from "../config/launch-config.js";
-import type { DapRequestArguments, DapRequestCommand, DapResponse, DebugAdapter } from "../dap/index.js";
+import type { DapRequestMap, DebugAdapter } from "../dap";
 import type {
   BreakpointSet,
   DebuggeeExit,
@@ -537,7 +537,7 @@ export class DebugSession {
       // Complete the handshake even if a breakpoint request failed, unless closure/cancellation has begun.
       if (supportsConfigurationDone && !signal.aborted) {
         try {
-          await this.request("configurationDone", {}, START_TIMEOUT_MS, signal);
+          await this.request("configurationDone", undefined, START_TIMEOUT_MS, signal);
         } catch (error) {
           // A secondary handshake failure must not replace the original configuration error.
           if (!configurationFailed) throw error;
@@ -692,7 +692,7 @@ export class DebugSession {
   // Thread selection and inspection
 
   private async fetchThreads(signal?: AbortSignal): Promise<Thread[]> {
-    const response = await this.request("threads", {}, REQUEST_TIMEOUT_MS, signal);
+    const response = await this.request("threads", undefined, REQUEST_TIMEOUT_MS, signal);
     this.assertActive();
     const activeIds = new Set(response.body.threads.map((thread) => thread.id));
     let removedThread = false;
@@ -1043,25 +1043,25 @@ export class DebugSession {
     }
   }
 
-  private async request<C extends DapRequestCommand>(
+  private async request<C extends keyof DapRequestMap>(
     command: C,
-    args: DapRequestArguments<C>,
+    args: DapRequestMap[C][0],
     timeoutMs: number,
     signal?: AbortSignal,
-  ): Promise<DapResponse<C>> {
+  ): Promise<DapRequestMap[C][1]> {
     const combined = signal ? AbortSignal.any([signal, this.lifetime.signal]) : this.lifetime.signal;
     const response = await this.sendRequest(command, args, timeoutMs, combined);
     combined.throwIfAborted();
     return response;
   }
 
-  private sendRequest<C extends DapRequestCommand>(
+  private sendRequest<C extends keyof DapRequestMap>(
     command: C,
-    args: DapRequestArguments<C>,
+    args: DapRequestMap[C][0],
     timeoutMs: number,
     signal?: AbortSignal,
-  ): Promise<DapResponse<C>> {
-    return new Promise<DapResponse<C>>((resolvePromise, rejectPromise) => {
+  ): Promise<DapRequestMap[C][1]> {
+    return new Promise<DapRequestMap[C][1]>((resolvePromise, rejectPromise) => {
       if (signal?.aborted) {
         rejectPromise(abortError(signal));
         return;
@@ -1082,11 +1082,12 @@ export class DebugSession {
             if (settled) return;
             settled = true;
             signal?.removeEventListener("abort", aborted);
+            // TODO 判断 command 是否为 dap 层返回的哨兵值 "canceled"
             if (!response.success) {
               rejectPromise(new Error(formatResponseError(response)));
               return;
             }
-            resolvePromise(response as DapResponse<C>);
+            resolvePromise(response as DapRequestMap[C][1]);
           },
           timeoutMs,
         );
