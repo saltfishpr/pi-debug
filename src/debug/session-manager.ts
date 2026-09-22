@@ -1,147 +1,153 @@
+import { resolve } from "node:path";
 import { getDebugAdapterProvider } from "../adapters/index.js";
-import { AsyncDisposableStore } from "../common/lifecycle.js";
-import { loadDebugConfigurations } from "../config/launch-config.js";
-import { DapClient, RequestTimeoutError } from "../dap/index.js";
-import type { DebugArguments } from "../tool/schema.js";
+import { loadDebugConfigurations, type DebugConfiguration } from "../config/launch-config.js";
+import { resolveVariables } from "../config/variables.js";
 import { DebugSession } from "./session.js";
+import type { SessionStartOptions, SessionStatus, StartResult } from "./types.js";
 
-/** 管理单个活动调试会话，并串行执行工具调用以避免执行状态相互覆盖。 */
+/** Owns the single debug session associated with one Pi extension session. */
 export class DebugSessionManager {
-  private readonly resources = new AsyncDisposableStore();
-  /** 管理器生命周期的取消源，用于在关闭时中止当前及后续操作。 */
+  private disposePromise: Promise<void> | undefined;
   private readonly lifetime = new AbortController();
 
-  /** 当前活动的调试会话；未启动或已终止时为空。 */
   private session: DebugSession | undefined;
-  /** 工具调用队列的尾部 Promise，用于保证调试操作按提交顺序执行。 */
-  private pending: Promise<unknown> = Promise.resolve();
+  private startupAbort: AbortController | undefined;
+  private hadSession = false;
 
-  constructor() {
-    this.resources.add({
-      dispose: async () => {
-        await this.pending;
-      },
-    });
-    this.resources.add({ dispose: () => this.closeSession() });
-  }
+  private transitionTail: Promise<void> = Promise.resolve();
 
-  /** 将一次工具调用加入串行队列，并统一处理取消、超时与会话失效。 */
-  execute(args: DebugArguments, cwd: string, signal?: AbortSignal): Promise<unknown> {
-    const combined = AbortSignal.any([this.lifetime.signal, ...(signal ? [signal] : [])]);
-    const result = this.pending.then(async () => {
-      combined.throwIfAborted();
-      try {
-        return await this.dispatch(args, cwd, combined);
-      } catch (error) {
-        // 已取消或超时的请求可能已经改变被调试进程，关闭会话以免暴露过期的停止状态。
-        if (combined.aborted || error instanceof RequestTimeoutError) {
-          await this.closeSession();
-        }
-        throw error;
-      }
-    });
-    this.pending = result.catch(() => {});
-    return result;
-  }
-
-  /** 终止管理器生命周期，等待队列清空，并释放当前调试会话。 */
-  close(): Promise<void> {
-    this.lifetime.abort(new Error("Pi session ended."));
-    return this.resources.dispose();
-  }
-
-  /** 从管理器摘除并关闭当前会话，避免并发调用复用已关闭实例。 */
-  private async closeSession(): Promise<void> {
-    const session = this.session;
-    this.session = undefined;
-    await session?.close();
-  }
-
-  /** 根据 action 校验参数并将调用分派给配置加载器、Adapter Provider 或活动会话。 */
-  private async dispatch(args: DebugArguments, cwd: string, signal: AbortSignal): Promise<unknown> {
-    switch (args.action) {
-      case "configurations":
-        return loadDebugConfigurations(cwd);
-      case "start":
-        return this.start(args, cwd, signal);
-      case "stop": {
-        const session = this.session;
-        await this.closeSession();
-        return session?.snapshot() ?? { state: "terminated" };
-      }
-      case "status":
-        return this.session?.snapshot() ?? { state: "idle" };
-      case "set_breakpoints":
-        if (!args.file || !args.lines)
-          throw new Error("set_breakpoints requires file and lines; [] clears that file's breakpoints.");
-        return this.requireSession().setBreakpoints(args.file, args.lines, signal);
-      case "continue":
-      case "next":
-        return this.requireSession().control(args.action, args.singleThread, args.threadId, args.waitMs, signal);
-      case "step_in":
-        return this.requireSession().control("stepIn", args.singleThread, args.threadId, args.waitMs, signal);
-      case "step_out":
-        return this.requireSession().control("stepOut", args.singleThread, args.threadId, args.waitMs, signal);
-      case "pause":
-        return this.requireSession().control("pause", false, args.threadId, args.waitMs, signal);
-      case "wait": {
-        const session = this.requireSession();
-        const result = await session.wait(args.threadId, args.waitMs ?? 1000, signal);
-        return { ...session.snapshot(), ...result };
-      }
-      case "threads":
-        return this.requireSession().listThreads(args.start, args.count, signal);
-      case "stack_trace":
-        return this.requireSession().stackTrace(args.threadId, args.start, args.count, signal);
-      case "variables":
-        return this.requireSession().variables(
-          args.threadId,
-          args.frame,
-          args.scope,
-          args.depth,
-          args.maxChildren,
-          signal,
-        );
-      case "evaluate":
-        return this.requireSession().evaluate(args.expression, args.threadId, args.frame, signal);
-      case "inspect":
-        return this.requireSession().inspect(
-          args.threadId,
-          args.frame,
-          args.scope,
-          args.depth,
-          args.maxChildren,
-          signal,
-        );
-    }
-  }
-
-  /** 解析配置并创建会话；启动失败时不保留失效会话。 */
-  private async start(args: DebugArguments, cwd: string, signal: AbortSignal): Promise<unknown> {
-    if (this.session) throw new Error("A debug session already exists. Stop it before starting another.");
-    if (!args.configuration) throw new Error("start requires a configuration name or inline configuration.");
-
-    const selected =
-      typeof args.configuration === "string"
-        ? (await loadDebugConfigurations(cwd)).find((configuration) => configuration.name === args.configuration)
-        : args.configuration;
-    if (!selected) throw new Error(`Debug configuration '${args.configuration}' not found.`);
-
-    const provider = getDebugAdapterProvider(selected.type);
-    const adapter = await provider.resolve(selected, cwd);
-    const session = new DebugSession(cwd, new DapClient(adapter.transport), selected.request, adapter.adapterID);
-    this.session = session;
-    try {
-      return await session.start(adapter.configuration, args.breakpoints, args.waitMs, signal);
-    } catch (error) {
-      this.session = undefined;
-      throw error;
-    }
-  }
-
-  /** 返回当前活动会话；不存在时给出下一步操作提示。 */
-  private requireSession(): DebugSession {
-    if (!this.session) throw new Error("No debug session. Use debug start first.");
+  /** Return the current session, including a closed session whose final status can still be inspected. */
+  getSession(): DebugSession {
+    if (!this.session) throw new Error('No debug session exists. Call debug with action "start" first.');
     return this.session;
   }
+
+  /** List saved launch and attach configurations for a project without exposing adapter-specific secrets. */
+  async configurations(cwd: string): Promise<{
+    configurations: Array<Pick<DebugConfiguration, "name" | "type" | "request">>;
+  }> {
+    this.assertNotDisposed();
+    const configurations = await loadDebugConfigurations(cwd);
+    return {
+      configurations: configurations.map(({ name, type, request }) => ({ name, type, request })),
+    };
+  }
+
+  /** Resolve a configuration, create its adapter and start a new session. */
+  async start(
+    requested: string | DebugConfiguration,
+    options: SessionStartOptions,
+    cwd: string,
+    signal?: AbortSignal,
+  ): Promise<StartResult> {
+    return this.withTransition(async () => {
+      this.assertNotDisposed();
+      if (this.session && !this.session.isClosed) {
+        throw new Error('A debug session is already running. Call debug with action "stop" before starting another.');
+      }
+      this.session = undefined;
+
+      const startupAbort = new AbortController();
+      this.startupAbort = startupAbort;
+      let session: DebugSession | undefined;
+      const startupSignal = anySignals(this.lifetime.signal, startupAbort.signal, signal);
+      try {
+        startupSignal.throwIfAborted();
+        const configuration = await this.resolveConfiguration(requested, cwd);
+        startupSignal.throwIfAborted();
+        const provider = getDebugAdapterProvider(configuration.type);
+        const resolved = await provider.resolve(configuration, cwd);
+        session = new DebugSession(resolved.adapter, resolved.configuration, cwd);
+        this.session = session;
+        this.hadSession = true;
+        return await session.start(options, startupSignal);
+      } catch (error) {
+        const state = session?.snapshot().state;
+        // Preserve failed cleanup for status inspection without replacing the original startup error.
+        if (session && this.session === session && !(state?.state === "closed" && state.cleanupError)) {
+          this.session = undefined;
+        }
+        throw error;
+      } finally {
+        if (this.startupAbort === startupAbort) this.startupAbort = undefined;
+      }
+    });
+  }
+
+  /** Close and forget the session, returning its final status or noSession if already absent. */
+  async stop(): Promise<{ kind: "closed"; status: SessionStatus } | { kind: "noSession" }> {
+    const interruptedStartup = this.startupAbort;
+    interruptedStartup?.abort(new Error("Debug session startup stopped by user."));
+    return this.withTransition(async () => {
+      const session = this.session;
+      if (!session) {
+        if (interruptedStartup || this.hadSession) return { kind: "noSession" };
+        throw new Error('No debug session exists. Call debug with action "start" first.');
+      }
+      await session.close();
+      const status = session.snapshot();
+      if (this.session === session) this.session = undefined;
+      return { kind: "closed", status };
+    });
+  }
+
+  /** Abort startup and release the current adapter. Safe to call more than once. */
+  dispose(): Promise<void> {
+    if (this.disposePromise) return this.disposePromise;
+    this.disposePromise = this.withTransition(async () => {
+      const session = this.session;
+      this.session = undefined;
+      if (!session) return;
+      await session.close();
+      const state = session.snapshot().state;
+      if (state.state === "closed" && state.cleanupError) throw new Error(state.cleanupError);
+    });
+    this.lifetime.abort(new Error("Debug session manager disposed."));
+    return this.disposePromise;
+  }
+
+  private async resolveConfiguration(requested: string | DebugConfiguration, cwd: string): Promise<DebugConfiguration> {
+    let configuration: DebugConfiguration;
+    if (typeof requested !== "string") {
+      configuration = resolveVariables(requested, cwd);
+    } else {
+      const configurations = await loadDebugConfigurations(cwd);
+      const saved = configurations.find((candidate) => candidate.name === requested);
+      if (!saved) {
+        const available = configurations.map((candidate) => candidate.name).join(", ");
+        throw new Error(
+          `Unknown debug configuration '${requested}'. Available configurations: ${available || "none"}.`,
+        );
+      }
+      configuration = saved;
+    }
+
+    return {
+      ...configuration,
+      ...(typeof configuration.cwd === "string" ? { cwd: resolve(cwd, configuration.cwd) } : {}),
+      ...(typeof configuration.program === "string" ? { program: resolve(cwd, configuration.program) } : {}),
+    };
+  }
+
+  private assertNotDisposed(): void {
+    if (this.disposePromise) throw new Error("Debug session manager has been disposed.");
+  }
+
+  private async withTransition<T>(operation: () => Promise<T>): Promise<T> {
+    const previous = this.transitionTail;
+    let release!: () => void;
+    this.transitionTail = new Promise<void>((resolvePromise) => {
+      release = resolvePromise;
+    });
+    await previous;
+    try {
+      return await operation();
+    } finally {
+      release();
+    }
+  }
+}
+
+function anySignals(...signals: Array<AbortSignal | undefined>): AbortSignal {
+  return AbortSignal.any(signals.filter((signal): signal is AbortSignal => signal !== undefined));
 }

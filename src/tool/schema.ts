@@ -1,70 +1,72 @@
 import { StringEnum, Type, type Static } from "@earendil-works/pi-ai";
 
-const breakpoint = Type.Object({
+const DEBUG_ACTIONS = [
+  "configurations",
+  "start",
+  "status",
+  "stop",
+  "set_breakpoints",
+  "continue",
+  "next",
+  "step_in",
+  "step_out",
+  "pause",
+  "wait",
+  "threads",
+  "stack_trace",
+  "inspect",
+  "variables",
+  "evaluate",
+  "output",
+] as const;
+
+const breakpointSchema = Type.Object({
   file: Type.String({ minLength: 1, description: "Source file path, absolute or relative to the project directory." }),
   lines: Type.Array(Type.Integer({ minimum: 1 }), {
     maxItems: 100,
-    description: "One-based line numbers in file at which execution should break.",
+    description: "One-based breakpoint line numbers in `file`.",
   }),
 });
+
+const configurationSchema = Type.Union(
+  [
+    Type.String({ minLength: 1, description: "Saved configuration name returned by `configurations`." }),
+    Type.Object(
+      {
+        name: Type.String({ description: "Name identifying this configuration in `status` output." }),
+        type: Type.String({
+          description: "Debugger type for the target program, as used in the `type` field of launch.json.",
+        }),
+        request: StringEnum(["launch", "attach"] as const, {
+          description: "`launch` starts a new program under the debugger; `attach` connects to an existing program.",
+        }),
+      },
+      {
+        additionalProperties: true,
+        description:
+          "Inline alternative to a saved configuration. Include target-specific launch.json fields, such as `program`, `args`, or a process selector, alongside `name`, `type`, and `request`.",
+      },
+    ),
+  ],
+  { description: "Required for `start`: a saved configuration name or an inline launch/attach configuration." },
+);
 
 /** Public debugger arguments; action-specific requirements are checked before execution. */
 export const debugParameters = Type.Object(
   {
     // 操作选择
-    action: StringEnum(
-      [
-        "configurations",
-        "start",
-        "stop",
-        "status",
-        "set_breakpoints",
-        "continue",
-        "next",
-        "step_in",
-        "step_out",
-        "pause",
-        "wait",
-        "threads",
-        "stack_trace",
-        "variables",
-        "evaluate",
-        "inspect",
-      ] as const,
-      {
-        description:
-          "Operation to perform. configurations lists saved configurations; start begins a new session; stop ends it. status reports current session and thread state without blocking; wait blocks until the next stop or exit. set_breakpoints installs breakpoints in a source file. continue, next, step_in, and step_out resume a stopped thread; pause interrupts a running thread. threads and stack_trace enumerate concurrent work and call frames. variables and evaluate read state at a specific frame; inspect returns a combined stack and locals snapshot suitable as a first look after a stop.",
-      },
-    ),
+    action: StringEnum(DEBUG_ACTIONS, {
+      description:
+        "Choose an operation: `configurations` lists saved configurations; `start` opens a session; `stop` closes it; `status` reports current state; `wait` awaits a new stop, thread exit, or completed session closure. `set_breakpoints` replaces a file's breakpoints. `continue` resumes execution; `next` steps over; `step_in` steps into; `step_out` steps out; `pause` interrupts execution. `threads` lists threads; `stack_trace` lists frames; `variables` reads a scope or variable container; `evaluate` evaluates an expression in a frame; `output` reads buffered program output. `inspect` returns a bounded overview of the stack, selected frame, scopes, variables, and available source context.",
+    }),
 
     // 启动配置
-    configuration: Type.Optional(
-      Type.Union(
-        [
-          Type.String({ minLength: 1, description: "Name of a saved configuration returned by the configurations action." }),
-          Type.Object(
-            {
-              name: Type.String({ description: "Display name for this configuration; used only in status output." }),
-              type: Type.String({ description: "Debugger type for the target program, matching the type field used in launch.json." }),
-              request: StringEnum(["launch", "attach"] as const, {
-                description: "launch starts a new program under the debugger; attach connects to an already running one.",
-              }),
-            },
-            {
-              additionalProperties: true,
-              description:
-                "Inline configuration used when no saved configuration exists. Include target-specific fields such as program path, arguments, or a process selector alongside name, type, and request.",
-            },
-          ),
-        ],
-        { description: "Required for start. Provide either a saved configuration name or an inline configuration object." },
-      ),
-    ),
+    configuration: Type.Optional(configurationSchema),
     breakpoints: Type.Optional(
-      Type.Array(breakpoint, {
+      Type.Array(breakpointSchema, {
         maxItems: 100,
         description:
-          "For start: initial breakpoint set installed before the target program begins executing. Later changes must go through set_breakpoints.",
+          "For `start`: source breakpoints installed during session setup; defaults to none. Use `set_breakpoints` for later changes. Attaching does not undo execution that occurred before setup.",
       }),
     ),
 
@@ -72,14 +74,14 @@ export const debugParameters = Type.Object(
     file: Type.Optional(
       Type.String({
         minLength: 1,
-        description: "Required for set_breakpoints. Source file path, absolute or relative to the project directory.",
+        description: "Required for `set_breakpoints`: source file path, absolute or relative to the project directory.",
       }),
     ),
     lines: Type.Optional(
       Type.Array(Type.Integer({ minimum: 1 }), {
         maxItems: 100,
         description:
-          "Required for set_breakpoints. One-based line numbers, treated as the full breakpoint set for file: entries not present are removed and an empty array clears all breakpoints in that file. To keep an existing breakpoint, include its line here.",
+          "Required for `set_breakpoints`: one-based line numbers replacing all breakpoints in `file`, not appending to them. Include existing lines you want to keep; an empty array clears the file's breakpoints.",
       }),
     ),
 
@@ -87,14 +89,14 @@ export const debugParameters = Type.Object(
     singleThread: Type.Optional(
       Type.Boolean({
         description:
-          "For continue, next, step_in, and step_out. When true, resume only the selected thread instead of all threads; default false. Requires supportsSingleThreadExecution to be true in status, otherwise the request fails. This flag does not pause threads that are already running.",
+          "For `continue`, `next`, `step_in`, and `step_out`: request resuming only the selected thread; defaults to false. Requires `capabilities.supportsSingleThreadExecutionRequests` in `status` to be true. Does not pause other running threads.",
       }),
     ),
     threadId: Type.Optional(
       Type.Integer({
         minimum: 1,
         description:
-          "Target thread from the threads action. For inspection and stepping actions, defaults to the thread from the most recent stopped event, or the only stopped thread when unambiguous; must be supplied when multiple stopped threads are eligible, and the target thread must be stopped. pause targets a thread not currently stopped. For wait, omit to await any stop or termination; supply to await this specific thread stopping or exiting.",
+          "Thread from `threads` or a stop result. For inspection, `continue`, and stepping: omit to select the most recently stopped thread if still stopped, otherwise the only stopped thread; required if neither rule resolves the choice. For `pause`: omit only when exactly one thread can be paused. For `wait`: omit to await any new stop or session closure; supply to await this thread's new stop or exit, or session closure.",
       }),
     ),
     waitMs: Type.Optional(
@@ -102,7 +104,16 @@ export const debugParameters = Type.Object(
         minimum: 0,
         maximum: 30000,
         description:
-          "For start, execution control actions, and wait. Maximum time in milliseconds to await a new stop, target thread exit, or program termination; default 1000. On expiry the call returns with the current state and does not interrupt execution, and control actions wait for a new stop rather than an existing stop on another thread. Read waitOutcome in the result to distinguish stop, exit, and timeout.",
+          "For `start`, `continue`, stepping, `pause`, and `wait`: event-wait budget in milliseconds; defaults to 1000. Zero checks for a new event or closed state without waiting. Not a deadline for the entire tool call: setup, requests, and result inspection may take additional time. Execution-control actions wait for the selected thread's new stop or exit, or completed session closure, not an existing stop on another thread.",
+      }),
+    ),
+
+    // 输出筛选
+    category: Type.Optional(
+      Type.String({
+        minLength: 1,
+        description:
+          "For `output`: filter buffered events by category, such as `stdout`, `stderr`, `console`, `important`, or `telemetry`. Omit to include all categories.",
       }),
     ),
 
@@ -111,7 +122,7 @@ export const debugParameters = Type.Object(
       Type.Integer({
         minimum: 0,
         description:
-          "For threads and stack_trace. Zero-based offset of the first entry to return; default 0. Pass the nextStart from the previous response to fetch the following page.",
+          "For `threads`, `output`, `stack_trace`, and `variables`: zero-based offset in the selected list or container; defaults to 0. For `output`, applied after category filtering. Use the previous result's `nextStart` to fetch the next page with the same selection.",
       }),
     ),
     count: Type.Optional(
@@ -119,42 +130,31 @@ export const debugParameters = Type.Object(
         minimum: 1,
         maximum: 100,
         description:
-          "For threads and stack_trace. Maximum entries in the returned page; default 50 for threads and 20 for stack frames. Output size limits may return fewer entries even when more exist; use nextStart to continue.",
+          "For `threads`, `output`, `stack_trace`, and `variables`: maximum entries per page. Defaults to 20 for `stack_trace`, 50 for the others. Does not change the fixed limits of `inspect`.",
       }),
     ),
 
     // 栈帧与作用域选择
+    variablesReference: Type.Optional(
+      Type.Integer({
+        minimum: 1,
+        description:
+          "For `variables`: use a `variablesReference` from `variables` or `inspect` to read that container's direct children instead of selecting a scope. Use a reference from the selected thread's current stop; do not reuse it after execution resumes or changes. Cannot be combined with `frame` or `scope`.",
+      }),
+    ),
     frame: Type.Optional(
       Type.Integer({
         minimum: 0,
         maximum: 999,
         description:
-          "For inspect, variables, and evaluate. Zero-based index into the selected thread's call stack, where 0 is the top (currently executing) frame; default 0.",
+          "For `inspect`, `evaluate`, and scope-based `variables`: zero-based position in the selected thread's stack, not a frame identifier. Defaults to 0 (the top frame). For `variables`, cannot be combined with `variablesReference`.",
       }),
     ),
     scope: Type.Optional(
       Type.String({
         minLength: 1,
         description:
-          "For inspect and variables. Name of the scope to read at the selected frame, matched case-insensitively against the scopes reported by the debugger; default locals.",
-      }),
-    ),
-
-    // 变量展开限制
-    depth: Type.Optional(
-      Type.Integer({
-        minimum: 1,
-        maximum: 3,
-        description:
-          "For inspect and variables. Levels of nested structure to expand; default 2. Use 1 to see only top-level values and raise it to walk into nested fields.",
-      }),
-    ),
-    maxChildren: Type.Optional(
-      Type.Integer({
-        minimum: 1,
-        maximum: 50,
-        description:
-          "For inspect and variables. Maximum entries returned per scope or expanded structure; default 50. Overall output size limits may still truncate the response further.",
+          "For `inspect` and scope-based `variables`: scope name at the selected frame, matched case-insensitively; available names are returned by `inspect`. Defaults to `locals` for `variables`. When omitted for `inspect`, prefers a locals scope, then a non-expensive scope, then the first available scope. For `variables`, cannot be combined with `variablesReference`.",
       }),
     ),
 
@@ -163,7 +163,7 @@ export const debugParameters = Type.Object(
       Type.String({
         minLength: 1,
         description:
-          "Required for evaluate. Expression in the target program's language, evaluated in the selected thread and frame. Runs like real code, so function calls and assignments can mutate program state; prefer read-only expressions unless the side effect is intended.",
+          "Required for `evaluate`: expression in the target program's language, evaluated in the selected thread and frame.",
       }),
     ),
   },

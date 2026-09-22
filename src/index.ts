@@ -7,6 +7,6 @@ export default function (pi: ExtensionAPI): void {
   const manager = new DebugSessionManager();
   registerDebugTool(pi, manager);
   pi.on("session_shutdown", async () => {
-    await manager.close();
+    await manager.dispose();
   });
 }

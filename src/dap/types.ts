@@ -1,50 +1,51 @@
 import type { DebugProtocol } from "@vscode/debugprotocol";
+import type { Disposable } from "../common/lifecycle";
 
-/**
- * DAP 请求命令到 [参数, 响应] 类型的映射表。
- *
- * 只是"协议 schema 的类型来源"，不由 `DapClient.request` 直接使用；上层封装
- * （如具名方法）可以从这里取每个命令的参数与响应类型。列出的都是最初 attach /
- * launch 阶段必用的标准命令，自定义命令仍可以直接通过 `request(command, args)` 发出。
- */
-export interface DapRequests {
-  initialize: [DebugProtocol.InitializeRequestArguments, DebugProtocol.InitializeResponse];
-  launch: [DebugProtocol.LaunchRequestArguments & Record<string, unknown>, DebugProtocol.LaunchResponse];
-  attach: [DebugProtocol.AttachRequestArguments & Record<string, unknown>, DebugProtocol.AttachResponse];
-  configurationDone: [DebugProtocol.ConfigurationDoneArguments | undefined, DebugProtocol.ConfigurationDoneResponse];
-  setBreakpoints: [DebugProtocol.SetBreakpointsArguments, DebugProtocol.SetBreakpointsResponse];
+export interface DapRequestMap {
+  initialize: [DebugProtocol.InitializeRequest, DebugProtocol.InitializeResponse];
+  launch: [DebugProtocol.LaunchRequest, DebugProtocol.LaunchResponse];
+  attach: [DebugProtocol.AttachRequest, DebugProtocol.AttachResponse];
+  disconnect: [DebugProtocol.DisconnectRequest, DebugProtocol.DisconnectResponse];
+  configurationDone: [DebugProtocol.ConfigurationDoneRequest, DebugProtocol.ConfigurationDoneResponse];
+  setBreakpoints: [DebugProtocol.SetBreakpointsRequest, DebugProtocol.SetBreakpointsResponse];
   setExceptionBreakpoints: [
-    DebugProtocol.SetExceptionBreakpointsArguments,
+    DebugProtocol.SetExceptionBreakpointsRequest,
     DebugProtocol.SetExceptionBreakpointsResponse,
   ];
-  threads: [undefined, DebugProtocol.ThreadsResponse];
-  stackTrace: [DebugProtocol.StackTraceArguments, DebugProtocol.StackTraceResponse];
-  scopes: [DebugProtocol.ScopesArguments, DebugProtocol.ScopesResponse];
-  variables: [DebugProtocol.VariablesArguments, DebugProtocol.VariablesResponse];
-  evaluate: [DebugProtocol.EvaluateArguments, DebugProtocol.EvaluateResponse];
-  continue: [DebugProtocol.ContinueArguments, DebugProtocol.ContinueResponse];
-  next: [DebugProtocol.NextArguments, DebugProtocol.NextResponse];
-  stepIn: [DebugProtocol.StepInArguments, DebugProtocol.StepInResponse];
-  stepOut: [DebugProtocol.StepOutArguments, DebugProtocol.StepOutResponse];
-  pause: [DebugProtocol.PauseArguments, DebugProtocol.PauseResponse];
-  disconnect: [DebugProtocol.DisconnectArguments | undefined, DebugProtocol.DisconnectResponse];
-  terminate: [DebugProtocol.TerminateArguments | undefined, DebugProtocol.TerminateResponse];
+  continue: [DebugProtocol.ContinueRequest, DebugProtocol.ContinueResponse];
+  next: [DebugProtocol.NextRequest, DebugProtocol.NextResponse];
+  stepIn: [DebugProtocol.StepInRequest, DebugProtocol.StepInResponse];
+  stepOut: [DebugProtocol.StepOutRequest, DebugProtocol.StepOutResponse];
+  pause: [DebugProtocol.PauseRequest, DebugProtocol.PauseResponse];
+  stackTrace: [DebugProtocol.StackTraceRequest, DebugProtocol.StackTraceResponse];
+  scopes: [DebugProtocol.ScopesRequest, DebugProtocol.ScopesResponse];
+  variables: [DebugProtocol.VariablesRequest, DebugProtocol.VariablesResponse];
+  threads: [DebugProtocol.ThreadsRequest, DebugProtocol.ThreadsResponse];
+  evaluate: [DebugProtocol.EvaluateRequest, DebugProtocol.EvaluateResponse];
 }
 
-/** 单次 DAP 请求的调用侧控制参数。 */
-export interface RequestOptions {
-  /** 本次请求的超时时间（毫秒），覆盖 client 的默认值。 */
-  timeoutMs?: number;
-  /**
-   * 用于取消本地等待。仅影响调用方的 Promise，并不会让 Adapter 侧真的取消操作；
-   * 如需通知 Adapter 取消，应额外发送 DAP `cancel` 请求。
-   */
-  signal?: AbortSignal;
+export type DapRequestCommand = keyof DapRequestMap;
+export type DapRequest<C extends DapRequestCommand> = DapRequestMap[C][0];
+export type DapRequestArguments<C extends DapRequestCommand> = C extends "launch" | "attach"
+  ? Record<string, unknown>
+  : DapRequest<C>["arguments"];
+export type DapResponse<C extends DapRequestCommand> = DapRequestMap[C][1];
+
+export interface DebugAdapter extends Disposable {
+  readonly onError: Event<Error>;
+  readonly onExit: Event<number | null>;
+
+  onMessage(callback: (message: DebugProtocol.ProtocolMessage) => void): void;
+  onRequest(callback: (request: DebugProtocol.Request) => void): void;
+  onEvent(callback: (event: DebugProtocol.Event) => void): void;
+
+  startSession(signal?: AbortSignal): Promise<void>;
+  stopSession(): Promise<void>;
+
+  sendMessage(message: DebugProtocol.ProtocolMessage): void;
+  sendResponse(response: DebugProtocol.Response): void;
+  sendRequest(command: string, args: unknown, clb: (result: DebugProtocol.Response) => void, timeout?: number): number;
 }
 
-/**
- * 反向请求处理器（Adapter → Client 方向）。返回值会作为响应 body；
- * 抛出的错误会以 `success=false` 响应，`message` 取自 `Error.message`。
- * `signal` 在超时或连接关闭时被 abort，用于中止长任务。
- */
-export type ReverseRequestHandler = (request: DebugProtocol.Request, signal: AbortSignal) => unknown | Promise<unknown>;
+/** A function that subscribes to a debug adapter event. */
+export type Event<T> = (listener: (value: T) => void) => Disposable;

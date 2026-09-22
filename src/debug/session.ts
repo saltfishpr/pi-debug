@@ -1,818 +1,1154 @@
 import type { DebugProtocol } from "@vscode/debugprotocol";
-import { EventEmitter } from "node:events";
+import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
-import { AsyncDisposableStore } from "../common/lifecycle.js";
-import { DapClient, type DapRequests } from "../dap/index.js";
-import { TerminalProcesses } from "./terminal-processes.js";
+import type { DebugConfiguration } from "../config/launch-config.js";
+import type { DapRequestArguments, DapRequestCommand, DapResponse, DebugAdapter } from "../dap/index.js";
+import type {
+  BreakpointSet,
+  DebuggeeExit,
+  EvaluateOptions,
+  Evaluation,
+  ExecutionOutcome,
+  Inspection,
+  InspectOptions,
+  Output,
+  OutputOptions,
+  Page,
+  PaginationOptions,
+  PauseOptions,
+  ResumeOptions,
+  SessionEndReason,
+  SessionStatus as SessionSnapshot,
+  SessionStartOptions,
+  SessionState,
+  SetBreakpointsResult,
+  SourceBreakpoints,
+  SourceContext,
+  StackTrace,
+  StackTraceOptions,
+  StartResult,
+  Stop,
+  ThreadSnapshot,
+  ThreadState,
+  Variables,
+  VariablesOptions,
+  WaitOptions,
+} from "./types.js";
 
-/** 描述返回给调用方的单个变量及其按需展开的子变量。 */
-interface VariableView {
-  /** 变量在当前作用域或父变量中的名称。 */
-  name: string;
-  /** Adapter 格式化后的变量值。 */
-  value: string;
-  /** Adapter 提供的可选变量类型。 */
-  type?: string;
-  /** 在深度和预算允许时递归展开的子变量。 */
-  children?: VariableView[];
-  /** 标记变量是否仍有可通过 DAP 引用获取的子项。 */
-  expandable?: boolean;
-}
+const REQUEST_TIMEOUT_MS = 10_000;
+const START_TIMEOUT_MS = 30_000;
+const DISCONNECT_TIMEOUT_MS = 2_000;
+const OUTPUT_BUFFER_LIMIT = 1_000;
 
-/** 记录一次变量树展开尚可使用的节点数和字符数预算。 */
-interface VariableBudget {
-  /** 尚可加入结果的变量节点数。 */
-  remaining: number;
-  /** 尚可加入结果的字符数。 */
-  characters: number;
-  /** 标记结果是否因节点、字符、深度或循环引用限制而被截断。 */
-  truncated: boolean;
-}
-
-/** 保存线程的运行证据；undefined 表示尚无停止或继续事件确认。 */
-interface ThreadRecord {
+interface Thread {
+  id: number;
   name?: string;
-  stopped?: boolean;
-  details?: DebugProtocol.StoppedEvent["body"];
-  revision: number;
-  continuedRevision?: number;
-  stoppedAt?: number;
+  state: ThreadState;
+  executionRevision: number;
+  lastRevision: number;
+  stop?: Stop;
 }
 
-/** 维护单个事件驱动的 DAP 会话，并封装不会向外泄漏的帧与变量引用。 */
+/** One persistent Debug Adapter Protocol session and its command semantics. */
 export class DebugSession {
-  private readonly resources = new AsyncDisposableStore();
-  /** 处理 Adapter 发起的 runInTerminal 请求所创建的进程。 */
-  private readonly terminalProcesses: TerminalProcesses;
-  /** 会话状态变化通知器，供异步等待逻辑订阅。 */
-  private readonly changes = new EventEmitter();
+  // Lifecycle and transport state
+  private state: SessionState = { state: "starting" };
+  private debuggeeExit: DebuggeeExit | undefined;
+  private readonly lifetime = new AbortController();
+  private transportStart: Promise<void> | undefined;
+  private initializeCompleted = false;
+  private adapterExited = false;
+  private closePromise: Promise<void> | undefined;
 
-  /** 当前调试会话状态。 */
-  private state: "starting" | "running" | "stopped" | "terminated" = "starting";
-  /** 标记 Adapter 是否已发送 initialized 事件。 */
-  private initialized = false;
-  /** 连接异常终止时记录的失败信息。 */
-  private failure: string | undefined;
-  /** 被调试进程通过 exited 事件报告的退出码。 */
-  private exitCode: number | undefined;
-  /** Adapter 声明及后续动态更新的能力集合。 */
+  // Negotiated protocol state
   private capabilities: DebugProtocol.Capabilities = {};
 
-  // -- 线程状态与事件顺序 ------------------------------------------------------
-
-  /** 线程目录与事件确认的停止状态；不缓存帧或变量引用。 */
-  private readonly threads = new Map<number, ThreadRecord>();
-  /** 记录已通过 thread exited 事件退出的线程 ID，避免后续 refresh 复活。 */
-  private readonly exitedThreads = new Set<number>();
-  /** 当前默认操作的线程，通常是最近一次 stopped 事件报告的线程。 */
-  private selectedThread: number | undefined;
-  /** 事件确认的所有线程整体停止标志。 */
-  private allStopped = false;
-  /** 尚未枚举的线程继承最近的全局事件；局部继续不能抹掉其他线程的全停证据。 */
-  private defaultStopped: boolean | undefined;
-  /** 执行状态的修订号，用于识别早于请求响应到达的 stopped 事件。 */
+  // Thread execution state
+  private readonly threadsById = new Map<number, Thread>();
   private revision = 0;
-  /** 记录最近一次 stopped 事件对应的修订号，用于等待新一次停止。 */
-  private stopRevision = 0;
-  /** 记录最近一次 allThreadsStopped 事件的修订号，避免其他线程的继续操作抹掉全停证据。 */
-  private allStoppedRevision = 0;
-  /** 记录最近一次 allThreadsContinued 事件的修订号，用于判断是否需要根据响应补写线程状态。 */
-  private allContinuedRevision = 0;
+  private lastStoppedThreadId: number | undefined;
+  private lastStop: { revision: number; threadId?: number; details: Stop } | undefined;
+  private allThreadsStoppedRevision: number | undefined;
 
-  // -- Adapter 输出 -----------------------------------------------------------
+  // Debuggee output state
+  private readonly outputBuffer: DebugProtocol.OutputEvent["body"][] = [];
 
-  /** 尚未通过 status 返回的 Adapter 输出。 */
-  private output = "";
-  /** 标记当前缓存的 Adapter 输出是否因长度限制被截断。 */
-  private outputTruncated = false;
+  // Startup handshake state
+  private initializedSeen = false;
+  private configureOnInitialized: (() => void) | undefined;
+
+  // Concurrency coordination
+  private readonly changeListeners = new Set<() => void>();
+  private mutationTail: Promise<void> = Promise.resolve();
 
   constructor(
-    /** 会话工作目录，用于把调用方传入的相对路径解析为绝对路径。 */
-    readonly workspaceFolder: string,
-    /** 与 Debug Adapter 通信的 DAP 客户端。 */
-    private readonly client: DapClient,
-    /** 会话的启动模式，决定启动请求及关闭时是否终止被调试进程。 */
-    private readonly launchCommand: "launch" | "attach",
-    /** initialize 请求中声明的 Debug Adapter 标识。 */
-    private readonly adapterID: string,
+    private readonly adapter: DebugAdapter,
+    private readonly configuration: DebugConfiguration,
+    private readonly cwd: string,
   ) {
-    this.terminalProcesses = new TerminalProcesses(workspaceFolder, (text) => this.appendOutput(text));
-    client.onEvent((event) => this.onEvent(event));
-    client.onOutput("stderr", (data) => this.appendOutput(data.toString("utf8")));
-    client.onOutput("stdout", (data) => this.appendOutput(data.toString("utf8")));
-    client.onClose((error) => {
-      if (this.state !== "terminated") this.failure = error.message;
-      this.markTerminated();
-      void this.close().catch((cause) => {
-        this.failure = cause instanceof Error ? cause.message : String(cause);
-      });
-    });
-    client.onReverseRequest("runInTerminal", (request, signal) => {
-      if (this.resources.isDisposed || this.state === "terminated")
-        throw new Error("Debug session is closing or terminated.");
-      return this.terminalProcesses.run(request.arguments, signal);
-    });
+    adapter.onEvent((event) => this.handleEvent(event));
+    adapter.onRequest((request) => this.handleReverseRequest(request));
+    adapter.onError((error) => this.handleAdapterError(error));
+    adapter.onExit((code) => this.handleAdapterExit(code));
   }
 
-  /** 收敛终止流程共用的状态清理：状态、线程目录、修订号推进与变化通知。 */
-  private markTerminated(): void {
-    this.state = "terminated";
-    this.threads.clear();
-    this.exitedThreads.clear();
-    this.selectedThread = undefined;
-    this.allStopped = false;
-    this.defaultStopped = undefined;
-    this.revision++;
-    this.changes.emit("change");
+  // State queries
+  get isClosed(): boolean {
+    return this.state.state === "closed";
   }
 
-  // -- 生命周期 -------------------------------------------------------------
+  snapshot(): SessionSnapshot {
+    const threads = [...this.threadsById.values()]
+      .filter((thread) => thread.state !== "exited")
+      .sort((a, b) => a.id - b.id)
+      .map((thread) => ({
+        id: thread.id,
+        ...(thread.name ? { name: thread.name } : {}),
+        state: thread.state,
+        ...(thread.stop ? { stop: thread.stop } : {}),
+      }));
 
-  /** 连接 Adapter、完成 DAP 初始化和断点配置，并返回启动后的会话状态。 */
-  async start(
-    configuration: Record<string, unknown>,
-    initialBreakpoints: { file: string; lines: number[] }[] = [],
-    waitMs = 1000,
-    signal?: AbortSignal,
-  ): Promise<unknown> {
-    try {
-      await this.client.connect({ signal });
-      this.capabilities =
-        (await this.request(
-          "initialize",
-          {
-            clientID: "pi-debug",
-            clientName: "Pi Debug",
-            adapterID: this.adapterID,
-            pathFormat: "path",
-            linesStartAt1: true,
-            columnsStartAt1: true,
-            supportsVariableType: true,
-            supportsVariablePaging: true,
-            supportsInvalidatedEvent: true,
-            supportsRunInTerminalRequest: true,
-            supportsStartDebuggingRequest: false,
-          },
-          signal,
-        )) ?? {};
-      // launch 可能要等到 configurationDone 后才返回，因此并行执行启动与配置流程。
-      const launching = this.request(this.launchCommand, configuration, signal);
-      const configuring = (async () => {
-        await this.waitUntil(() => this.initialized, 30000, signal);
-        if (!this.initialized) throw new Error(this.failure ?? "Adapter did not send initialized.");
-        const breakpoints = [];
-        for (const item of initialBreakpoints) {
-          breakpoints.push(await this.setBreakpoints(item.file, item.lines, signal));
-        }
-        if (
-          !this.capabilities.supportsConfigurationDoneRequest ||
-          this.capabilities.exceptionBreakpointFilters?.length
-        ) {
-          await this.request("setExceptionBreakpoints", { filters: [] }, signal);
-        }
-        if (this.capabilities.supportsConfigurationDoneRequest) {
-          await this.request("configurationDone", {}, signal);
-        }
-        return breakpoints;
-      })();
-      const [, breakpoints] = await Promise.all([launching, configuring]);
-      if (this.state === "starting") this.state = "running";
-      const result = await this.wait(undefined, waitMs, signal);
-      return { ...this.snapshot(), ...result, breakpoints };
-    } catch (error) {
-      const diagnostics = this.output;
-      await this.close();
-      const message = error instanceof Error ? error.message : String(error);
-      throw new Error(`${message}${diagnostics ? `\nAdapter output: ${diagnostics}` : ""}`, { cause: error });
-    }
-  }
-
-  /** 幂等断开 DAP 会话并释放底层客户端资源。 */
-  close(terminateDebuggee?: boolean): Promise<void> {
-    terminateDebuggee ??= this.launchCommand === "launch";
-    if (!this.resources.isDisposed) {
-      this.resources.add({
-        dispose: async () => {
-          try {
-            await this.client.request(
-              "disconnect",
-              this.capabilities.supportTerminateDebuggee ? { terminateDebuggee } : {},
-              { timeoutMs: 3000 },
-            );
-          } catch {
-            // Adapter 已断开时仍须释放本地资源。
-          }
-        },
-      });
-      this.resources.add({ dispose: () => this.markTerminated() });
-      this.resources.add({ dispose: () => this.client.close() });
-      this.resources.add({ dispose: () => this.terminalProcesses.close() });
-    }
-    return this.resources.dispose();
-  }
-
-  // -- 会话状态查询 ---------------------------------------------------------
-
-  /** 返回当前会话快照，并消费自上次查询后累积的 Adapter 输出。 */
-  snapshot() {
-    const selected = this.selectedThread === undefined ? undefined : this.threads.get(this.selectedThread);
-    const result = {
-      state: this.state,
-      reason: selected?.details?.reason,
-      threadId: this.selectedThread,
-      description: selected?.details?.description,
-      allThreadsStopped: this.state === "stopped" ? this.allStopped : undefined,
-      knownThreadCount: this.threads.size,
-      knownStoppedThreadCount: [...this.threads.values()].filter((thread) => thread.stopped).length,
-      supportsSingleThreadExecution: this.capabilities.supportsSingleThreadExecutionRequests === true,
-      exitCode: this.exitCode,
-      error: this.failure,
-      output: this.output,
-      outputTruncated: this.outputTruncated,
-    };
-    this.output = "";
-    this.outputTruncated = false;
-    return result;
-  }
-
-  // -- 断点与执行控制 -------------------------------------------------------
-
-  /** 替换指定源文件的全部断点，并返回 Adapter 验证后的断点信息。 */
-  async setBreakpoints(file: string, lines: number[], signal?: AbortSignal) {
-    const path = resolve(this.workspaceFolder, file);
-    const result = await this.request(
-      "setBreakpoints",
-      {
-        source: { path },
-        breakpoints: lines.map((line) => ({ line })),
-        sourceModified: false,
+    return {
+      state: structuredClone(this.state),
+      configuration: {
+        name: this.configuration.name,
+        type: this.configuration.type,
+        request: this.configuration.request,
       },
+      capabilities: {
+        supportsSingleThreadExecutionRequests: this.capabilities.supportsSingleThreadExecutionRequests === true,
+      },
+      threads,
+      ...(this.debuggeeExit ? { debuggeeExit: { ...this.debuggeeExit } } : {}),
+    };
+  }
+
+  // Lifecycle commands
+
+  /** Start the transport and complete the DAP configuration handshake. */
+  async start(options: SessionStartOptions, signal?: AbortSignal): Promise<StartResult> {
+    if (this.state.state !== "starting" || this.transportStart) {
+      throw new Error(`Cannot start a debug session in state '${this.state.state}'.`);
+    }
+    const baseline = this.revision;
+    const startupSignal = signal ? AbortSignal.any([signal, this.lifetime.signal]) : this.lifetime.signal;
+    const onAbort = (): void => {
+      void this.close();
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+
+    try {
+      if (signal?.aborted) onAbort();
+      startupSignal.throwIfAborted();
+      // Register the resource acquisition before invoking adapter code, which may close us synchronously.
+      this.transportStart = Promise.resolve().then(async () => {
+        startupSignal.throwIfAborted();
+        await this.adapter.startSession(startupSignal);
+      });
+      await this.transportStart;
+      startupSignal.throwIfAborted();
+
+      const initialize = await this.request(
+        "initialize",
+        {
+          clientID: "pi-debug",
+          clientName: "pi-debug",
+          adapterID: this.configuration.type,
+          linesStartAt1: true,
+          columnsStartAt1: true,
+          pathFormat: "path",
+          supportsVariableType: true,
+          supportsVariablePaging: true,
+          supportsRunInTerminalRequest: false,
+          supportsProgressReporting: false,
+          supportsInvalidatedEvent: true,
+          supportsMemoryEvent: false,
+          supportsStartDebuggingRequest: false,
+        },
+        START_TIMEOUT_MS,
+        signal,
+      );
+      startupSignal.throwIfAborted();
+      this.mergeCapabilities(initialize.body);
+      this.initializeCompleted = true;
+
+      const configurationDone = new Promise<BreakpointSet[]>((resolve, reject) => {
+        this.configureOnInitialized = () => {
+          this.configureOnInitialized = undefined;
+          void this.configure(options.breakpoints, startupSignal).then(resolve, reject);
+        };
+      });
+      const configured = withTimeout(configurationDone, START_TIMEOUT_MS, "debug configuration", startupSignal);
+      // initialized may arrive before the initialize continuation installs the configuration callback.
+      if (this.initializedSeen) this.configureOnInitialized?.();
+
+      const launchOrAttach = this.request(this.configuration.request, this.configuration, START_TIMEOUT_MS, signal);
+      const [, breakpoints] = await Promise.all([launchOrAttach, configured]);
+
+      startupSignal.throwIfAborted();
+      this.state = { state: "active" };
+      const waited = await this.waitAfter(baseline, { waitMs: options.waitMs }, signal);
+      return {
+        execution: waited,
+        breakpoints,
+      };
+    } catch (error) {
+      await this.beginClose({ kind: "error", message: errorMessage(error) });
+      throw error;
+    } finally {
+      this.configureOnInitialized = undefined;
+      signal?.removeEventListener("abort", onAbort);
+    }
+  }
+
+  /** Request closure and await cleanup. Failures are reported in the final status, not thrown. */
+  close(): Promise<void> {
+    return this.beginClose({ kind: "requested" });
+  }
+
+  // Breakpoint commands
+
+  /** Replace all source breakpoints in one file. */
+  async setBreakpoints(file: string, lines: readonly number[], signal?: AbortSignal): Promise<SetBreakpointsResult> {
+    this.assertActive();
+    return this.withMutation(async () => {
+      this.assertActive();
+      const breakpoints = await this.sendBreakpoints(file, lines, signal);
+      return { breakpoints: { source: { path: resolve(this.cwd, file) }, breakpoints: breakpoints } };
+    });
+  }
+
+  // Execution commands
+
+  /** Continue a stopped thread or all threads. */
+  async continue(options: ResumeOptions, signal?: AbortSignal): Promise<ExecutionOutcome> {
+    return this.resume("continue", options, signal);
+  }
+
+  /** Step over in a stopped thread. */
+  async next(options: ResumeOptions, signal?: AbortSignal): Promise<ExecutionOutcome> {
+    return this.resume("next", options, signal);
+  }
+
+  /** Step into in a stopped thread. */
+  async stepIn(options: ResumeOptions, signal?: AbortSignal): Promise<ExecutionOutcome> {
+    return this.resume("stepIn", options, signal);
+  }
+
+  /** Step out in a stopped thread. */
+  async stepOut(options: ResumeOptions, signal?: AbortSignal): Promise<ExecutionOutcome> {
+    return this.resume("stepOut", options, signal);
+  }
+
+  /** Pause a running thread and optionally wait for the resulting stop. */
+  async pause(options: PauseOptions, signal?: AbortSignal): Promise<ExecutionOutcome> {
+    this.assertActive();
+    let baseline = this.revision;
+    let threadId = 0;
+
+    await this.withMutation(async () => {
+      this.assertActive();
+      threadId = await this.selectRunningThread(options.threadId, signal);
+      baseline = this.revision;
+      await this.request("pause", { threadId }, REQUEST_TIMEOUT_MS, signal);
+    }).catch((error: unknown) => {
+      signal?.throwIfAborted();
+      if (!this.lifetime.signal.aborted || error !== this.lifetime.signal.reason) throw error;
+    });
+
+    return this.waitAfter(baseline, { threadId, waitMs: options.waitMs }, signal);
+  }
+
+  /** Wait for a new stop, thread exit or completed closure; an already closed session returns immediately. */
+  async wait(options: WaitOptions, signal?: AbortSignal): Promise<ExecutionOutcome> {
+    return this.waitAfter(this.revision, options, signal);
+  }
+
+  // Inspection commands
+
+  /** Refresh and return a page of active threads. */
+  async threads(options: PaginationOptions, signal?: AbortSignal): Promise<Page<ThreadSnapshot>> {
+    this.assertActive();
+    const all = await this.fetchThreads(signal);
+    const page = all.slice(options.start, options.start + options.count).map(toThreadSnapshot);
+    const nextStart = options.start + page.length < all.length ? options.start + page.length : undefined;
+    return {
+      start: options.start,
+      items: page,
+      ...(nextStart !== undefined ? { nextStart } : {}),
+      total: all.length,
+    };
+  }
+
+  /** Return a page of stack frames for a stopped thread. */
+  async stackTrace(options: StackTraceOptions, signal?: AbortSignal): Promise<StackTrace> {
+    this.assertActive();
+    const thread = await this.selectStoppedThread(options.threadId, signal);
+    const revision = thread.executionRevision;
+    const response = await this.request(
+      "stackTrace",
+      {
+        threadId: thread.id,
+        startFrame: options.start,
+        levels: options.count,
+      },
+      REQUEST_TIMEOUT_MS,
       signal,
     );
-    return { file: path, breakpoints: result?.breakpoints ?? [] };
-  }
-
-  /** 执行继续、单步或暂停操作，并等待下一次停止或终止。 */
-  async control(
-    action: "continue" | "next" | "stepIn" | "stepOut" | "pause",
-    singleThread = false,
-    threadId?: number,
-    waitMs = 1000,
-    signal?: AbortSignal,
-  ) {
-    if (singleThread && (action === "pause" || !this.capabilities.supportsSingleThreadExecutionRequests)) {
-      throw new Error("singleThread requires a supported continue or stepping action.");
-    }
-    threadId = await this.thread(threadId, signal, action === "pause" ? "running" : "stopped");
-    const revision = this.revision;
-    const response = await this.request(action, { threadId, ...(singleThread ? { singleThread } : {}) }, signal);
-    // 响应仅补全尚未被更新事件覆盖的线程状态。
-    if (
-      action !== "pause" &&
-      this.state !== "terminated" &&
-      this.allContinuedRevision <= revision &&
-      (this.threads.get(threadId)?.continuedRevision ?? 0) <= revision
-    ) {
-      // 单步默认允许其他线程恢复；没有事件确认时不能承诺其他线程仍暂停。
-      const all =
-        action === "continue"
-          ? (response as DebugProtocol.ContinueResponse["body"])?.allThreadsContinued !== false
-          : !singleThread;
-      this.continued(threadId, all, revision);
-    }
-    const result = await this.waitForStop(threadId, waitMs, signal, revision);
-    return { ...this.snapshot(), ...result };
-  }
-
-  /** 等待会话停止、终止或达到指定超时时间。 */
-  async wait(threadId?: number, timeout = 1000, signal?: AbortSignal) {
-    if (threadId !== undefined && this.state !== "terminated" && !this.exitedThreads.has(threadId)) {
-      await this.refreshThreads(signal);
-      if (!this.threads.has(threadId) && !this.exitedThreads.has(threadId))
-        throw new Error(`Thread ${threadId} is unavailable.`);
-    }
-    return this.waitForStop(threadId, timeout, signal);
-  }
-
-  // -- 线程、调用栈与变量查询 -----------------------------------------------------
-
-  /** 查询当前线程列表，并保留事件提供的逐线程停止状态。 */
-  async listThreads(start = 0, count = 50, signal?: AbortSignal) {
-    await this.refreshThreads(signal);
-    const threads = [...this.threads]
-      .sort(([a], [b]) => a - b)
-      .slice(start, start + count)
-      .map(([threadId, thread]) => ({
-        threadId,
-        name: thread.name?.slice(0, 200),
-        state: thread.stopped === undefined ? "unknown" : thread.stopped ? "stopped" : "running",
-        reason: thread.details?.reason,
-        description: thread.details?.description?.slice(0, 500),
-      }));
+    this.assertThreadRevision(thread.id, revision);
+    const frames = response.body.stackFrames.map((data, offset) => ({ index: options.start + offset, data }));
+    const total = response.body.totalFrames;
+    const nextStart =
+      frames.length === options.count && (total === undefined || options.start + frames.length < total)
+        ? options.start + frames.length
+        : undefined;
     return {
-      threads,
-      totalThreads: this.threads.size,
-      nextStart: start + count < this.threads.size ? start + count : undefined,
+      threadId: thread.id,
+      stack: {
+        start: options.start,
+        items: frames,
+        ...(total !== undefined ? { total } : {}),
+        ...(nextStart !== undefined ? { nextStart } : {}),
+      },
     };
   }
 
-  /** 分页获取目标线程的调用栈，frame 始终使用整个栈的零基索引。 */
-  async stackTrace(threadId?: number, start = 0, count = 20, signal?: AbortSignal) {
-    threadId = await this.thread(threadId, signal, "stopped");
-    const result = await this.fetchStackTrace(threadId, start, count, signal);
-    return this.formatStack(threadId, result, start, count);
+  /** Return one page of direct children from a scope or variable container. */
+  async variables(options: VariablesOptions, signal?: AbortSignal): Promise<Variables> {
+    this.assertActive();
+    const thread = await this.selectStoppedThread(options.threadId, signal);
+    const revision = thread.executionRevision;
+    let variablesReference: number;
+    let container: Variables["container"];
+
+    if (options.variablesReference !== undefined) {
+      if (options.variablesReference <= 0) throw new Error("variablesReference must be greater than zero.");
+      variablesReference = options.variablesReference;
+      container = { kind: "variable", variablesReference };
+    } else {
+      const frame = await this.resolveFrame(thread.id, options.frame, revision, signal);
+      const scope = await this.resolveScope(frame.id, options.scope, thread.id, revision, signal);
+      variablesReference = scope.variablesReference;
+      container = { kind: "scope", frameIndex: options.frame, scope };
+    }
+
+    const page = await this.readVariablesPage(
+      variablesReference,
+      options.start,
+      options.count,
+      thread.id,
+      revision,
+      signal,
+    );
+    this.assertThreadRevision(thread.id, revision);
+    return {
+      threadId: thread.id,
+      container,
+      variables: {
+        start: options.start,
+        items: page.variables,
+        ...(page.nextStart !== undefined ? { nextStart: page.nextStart } : {}),
+      },
+    };
   }
 
-  /** 获取指定栈帧和作用域中的变量树，并应用节点、字符及深度限制。 */
-  async variables(
-    threadId?: number,
-    frameIndex = 0,
-    scopeName = "locals",
-    depth = 2,
-    maxChildren = 50,
-    signal?: AbortSignal,
-  ) {
-    threadId = await this.thread(threadId, signal, "stopped");
-    const revision = this.revision;
-    const frame = await this.frame(threadId, frameIndex, signal);
-    this.checkRevision(revision);
-    const scope = await this.expandScope(frame.id, scopeName, depth, maxChildren, signal);
-    this.checkRevision(revision);
-    return { threadId, frame: frameIndex, ...scope };
-  }
-
-  /** 在指定栈帧上下文中求值表达式，并限制返回文本长度。 */
-  async evaluate(expression?: string, threadId?: number, frameIndex = 0, signal?: AbortSignal) {
-    if (!expression) throw new Error("evaluate requires expression.");
-    threadId = await this.thread(threadId, signal, "stopped");
-    const revision = this.revision;
-    const frame = await this.frame(threadId, frameIndex, signal);
-    this.checkRevision(revision);
-    const result = await this.request(
+  /** Evaluate an expression in a stopped stack frame. */
+  async evaluate(options: EvaluateOptions, signal?: AbortSignal): Promise<Evaluation> {
+    this.assertActive();
+    const thread = await this.selectStoppedThread(options.threadId, signal);
+    const revision = thread.executionRevision;
+    const frame = await this.resolveFrame(thread.id, options.frame, revision, signal);
+    const response = await this.request(
       "evaluate",
       {
-        expression,
+        expression: options.expression,
         frameId: frame.id,
         context: "watch",
       },
+      REQUEST_TIMEOUT_MS,
       signal,
     );
+    this.assertThreadRevision(thread.id, revision);
+    return { threadId: thread.id, frameIndex: options.frame, data: response.body };
+  }
+
+  /** Return a page of buffered debuggee output. */
+  output(options: OutputOptions): Page<Output> {
+    const all = options.category
+      ? this.outputBuffer.filter((entry) => entry.category === options.category)
+      : this.outputBuffer;
+    const output = all.slice(options.start, options.start + options.count);
+    const nextStart = options.start + output.length < all.length ? options.start + output.length : undefined;
     return {
-      threadId,
-      frame: frameIndex,
-      result: result?.result.slice(0, 2000),
-      type: result?.type,
-      truncated: (result?.result.length ?? 0) > 2000,
-      expandable: (result?.variablesReference ?? 0) > 0,
+      start: options.start,
+      items: output,
+      ...(nextStart !== undefined ? { nextStart } : {}),
+      total: all.length,
     };
   }
 
-  /** 返回同一线程的调用栈和所选栈帧变量。 */
-  async inspect(
-    threadId?: number,
-    frameIndex = 0,
-    scope = "locals",
-    depth = 2,
-    maxChildren = 50,
-    signal?: AbortSignal,
-  ) {
-    threadId = await this.thread(threadId, signal, "stopped");
-    const revision = this.revision;
-    // 一次 stackTrace 既用于返回展示栈，又提供接下来 expand 需要的 frameId，避免重复请求。
-    const start = 0;
-    const count = 20;
-    const result = await this.fetchStackTrace(threadId, start, count, signal);
-    this.checkRevision(revision);
-    const stack = this.formatStack(threadId, result, start, count);
-    // stack.frames 与 result.stackFrames 在 paged / 非 paged 两种模式下均以 start 为首元素，
-    // 目标帧 rawFrame 就是首页内相对位置；不在首页时回退到单帧拉取。
-    const rawFrame = result?.stackFrames?.[frameIndex - start];
-    const frame = rawFrame ?? (await this.frame(threadId, frameIndex, signal));
-    this.checkRevision(revision);
-    const variables = await this.expandScope(frame.id, scope, depth, maxChildren, signal);
-    this.checkRevision(revision);
-    return {
-      state: this.state,
-      reason: this.threads.get(threadId)?.details?.reason,
-      ...stack,
-      threadId,
-      frame: frameIndex,
-      ...variables,
-    };
-  }
-
-  // -- 内部：DAP 请求 -------------------------------------------------------
-
-  /** 发送类型安全的 DAP 请求，并从响应中提取命令对应的 body。 */
-  private async request<K extends keyof DapRequests>(
-    command: K,
-    args: DapRequests[K][0],
-    signal?: AbortSignal,
-  ): Promise<DapRequests[K][1]["body"]> {
-    const revision = this.revision;
-    const response = await this.client.request(command, args, { signal });
-    if (["stackTrace", "scopes", "variables", "evaluate"].includes(command)) this.checkRevision(revision);
-    return response.body as DapRequests[K][1]["body"];
-  }
-
-  /** 确认查询期间执行状态未变化，防止返回过期的帧或变量。 */
-  private checkRevision(revision: number): void {
-    if (revision !== this.revision || this.state === "terminated") {
-      throw new Error(
-        "Debug context changed during inspection. Query threads and inspect again; evaluation was not retried.",
-      );
-    }
-  }
-
-  // -- 内部：线程 -----------------------------------------------------------
-
-  /** 刷新线程目录，并在事件竞争时最多重试一次以获得一致快照。 */
-  private async refreshThreads(signal?: AbortSignal): Promise<void> {
-    // 事件与 threads 响应交错时会推进 revision，最多重试一次；仍不一致则要求调用方重问。
-    for (let attempt = 0; attempt < 2; attempt++) {
-      if (this.isTerminated()) return;
-      const revision = this.revision;
-      const result = await this.request("threads", undefined, signal);
-      if (this.isTerminated()) return;
-      if (revision !== this.revision) continue;
-      const ids = new Set((result?.threads ?? []).map((thread) => thread.id));
-      for (const id of this.threads.keys()) {
-        if (!ids.has(id)) {
-          this.threads.delete(id);
-          this.exitedThreads.add(id);
-          this.revision++;
-        }
-      }
-      for (const thread of result?.threads ?? []) {
-        const current = this.threads.get(thread.id);
-        this.threads.set(thread.id, {
-          ...current,
-          name: thread.name,
-          stopped: current ? current.stopped : this.defaultStopped,
-          revision: current?.revision ?? this.revision,
-        });
-        this.exitedThreads.delete(thread.id);
-      }
-      this.updateState();
-      return;
-    }
-    throw new Error("Threads changed during discovery. Query threads again.");
-  }
-
-  /** 解析目标线程，并校验它在当前会话中存在且满足运行状态要求。 */
-  private async thread(
-    id: number | undefined,
-    signal?: AbortSignal,
-    required?: "running" | "stopped",
-  ): Promise<number> {
-    if (this.state === "terminated") throw new Error("Session is terminated.");
-    await this.refreshThreads(signal);
-    if (
-      id === undefined &&
-      required !== "running" &&
-      this.selectedThread !== undefined &&
-      this.threads.get(this.selectedThread)?.stopped
-    ) {
-      id = this.selectedThread;
-    }
-    if (id === undefined) {
-      const candidates = [...this.threads].filter(
-        ([, thread]) =>
-          required === undefined || (required === "stopped" ? thread.stopped === true : thread.stopped !== true),
-      );
-      if (candidates.length !== 1) {
-        const reason = candidates.length
-          ? "multiple eligible threads; specify threadId from threads"
-          : "no eligible threads";
-        throw new Error(`Session is ${this.state}; ${reason}.`);
-      }
-      id = candidates[0][0];
-    }
-    const thread = this.threads.get(id);
-    if (!thread) throw new Error(`Thread ${id} is unavailable. Use threads to select a current thread.`);
-    if (required && (required === "stopped" ? thread.stopped !== true : thread.stopped === true)) {
-      throw new Error(`Thread ${id} must be ${required}.`);
-    }
-    return id;
-  }
-
-  // -- 内部：调用栈 ---------------------------------------------------------
-
-  /** 获取调用方指定索引处的单个栈帧，供变量查询和表达式求值使用。 */
-  private async frame(threadId: number, index = 0, signal?: AbortSignal) {
-    const paged = this.capabilities.supportsDelayedStackTraceLoading;
-    const result = await this.request(
+  /** Return a fixed-budget overview of a stopped thread and one selected frame. */
+  async inspect(options: InspectOptions, signal?: AbortSignal): Promise<Inspection> {
+    this.assertActive();
+    const thread = await this.selectStoppedThread(options.threadId, signal);
+    const revision = thread.executionRevision;
+    const stackResponse = await this.request(
       "stackTrace",
-      { threadId, ...(paged ? { startFrame: index, levels: 1 } : {}) },
+      { threadId: thread.id, startFrame: 0, levels: 20 },
+      REQUEST_TIMEOUT_MS,
       signal,
     );
-    const frame = result?.stackFrames[paged ? 0 : index];
-    if (!frame) throw new Error(`Stack frame ${index} is unavailable.`);
-    return frame;
-  }
+    this.assertThreadRevision(thread.id, revision);
 
-  /** 发送一次 stackTrace 请求，不对结果做展示层适配，供多个入口共享。 */
-  private fetchStackTrace(threadId: number, start: number, count: number, signal?: AbortSignal) {
-    return this.request(
-      "stackTrace",
-      { threadId, ...(this.capabilities.supportsDelayedStackTraceLoading ? { startFrame: start, levels: count } : {}) },
-      signal,
-    );
-  }
-
-  /** 将 stackTrace 响应整形为返回结构，同时处理 paged / 未 paged 分页差异。 */
-  private formatStack(
-    threadId: number,
-    result: DebugProtocol.StackTraceResponse["body"],
-    start: number,
-    count: number,
-  ) {
-    const paged = this.capabilities.supportsDelayedStackTraceLoading;
-    const frames = paged
-      ? (result?.stackFrames ?? []).slice(0, count)
-      : (result?.stackFrames ?? []).slice(start, start + count);
-    const totalFrames = result?.totalFrames ?? (paged ? undefined : result?.stackFrames.length);
-    const hasMore =
-      frames.length > 0 && (totalFrames === undefined ? frames.length === count : start + frames.length < totalFrames);
-    return {
-      threadId,
-      totalFrames,
-      nextStart: hasMore ? start + frames.length : undefined,
-      frames: frames.map((frame, index) => ({
-        frame: start + index,
-        name: frame.name.slice(0, 200),
-        file: frame.source?.path,
-        line: frame.line,
-        column: frame.column,
-      })),
+    const frames = stackResponse.body.stackFrames.map((data, index) => ({ index, data }));
+    const selectedFrame = frames[options.frame] ?? {
+      index: options.frame,
+      data: await this.resolveFrame(thread.id, options.frame, revision, signal),
     };
-  }
+    const scopesResponse = await this.request("scopes", { frameId: selectedFrame.data.id }, REQUEST_TIMEOUT_MS, signal);
+    this.assertThreadRevision(thread.id, revision);
 
-  // -- 内部：作用域 ---------------------------------------------------------
+    const scopes = scopesResponse.body.scopes;
+    const selected = this.selectInspectScope(scopes, options.scope);
+    const page = selected
+      ? await this.readVariablesPage(selected.variablesReference, 0, 50, thread.id, revision, signal)
+      : undefined;
+    this.assertThreadRevision(thread.id, revision);
 
-  /** 在指定栈帧上查找作用域并递归展开；供 variables 和 inspect 共用。 */
-  private async expandScope(
-    frameId: number,
-    scopeName: string,
-    depth: number,
-    maxChildren: number,
-    signal?: AbortSignal,
-  ) {
-    const result = await this.request("scopes", { frameId }, signal);
-    const scopes = result?.scopes ?? [];
-    const scope =
-      scopeName.toLowerCase() === "locals"
-        ? scopes.find((item) => item.presentationHint === "locals" || /^locals?$/i.test(item.name))
-        : scopes.find((item) => item.name.toLowerCase() === scopeName.toLowerCase());
-    if (!scope) {
-      throw new Error(
-        `Scope '${scopeName}' not found. Available scopes: ${scopes.map((item) => item.name).join(", ")}`,
-      );
-    }
-    const budget = { remaining: 100, characters: 12000, truncated: false };
-    const variables = await this.expand(scope.variablesReference, depth, maxChildren, budget, new Set(), signal);
-    return { scope: scope.name, variables, truncated: budget.truncated };
-  }
-
-  // -- 内部：会话状态 -------------------------------------------------------
-
-  /** 根据已知线程停止状态更新会话状态与默认选中线程。 */
-  private updateState(): void {
-    if (this.state === "terminated") return;
-    const stopped = [...this.threads].filter(([, thread]) => thread.stopped);
-    this.state = this.allStopped || stopped.length ? "stopped" : this.state === "starting" ? "starting" : "running";
-    if (this.selectedThread === undefined || !this.threads.get(this.selectedThread)?.stopped) {
-      const latest = stopped
-        .filter(([, thread]) => thread.details)
-        .sort(([, a], [, b]) => (b.stoppedAt ?? 0) - (a.stoppedAt ?? 0))[0];
-      this.selectedThread = latest?.[0];
-    }
-  }
-
-  /** 应用线程或全体线程继续执行的状态变化，不覆盖较新的停止事件。 */
-  private continued(threadId: number, all: boolean, before = Infinity): void {
-    if (this.allStoppedRevision <= before) {
-      this.allStopped = false;
-      if (all) this.defaultStopped = false;
-    }
-    if (!all && !this.threads.has(threadId) && !this.exitedThreads.has(threadId)) {
-      this.threads.set(threadId, { stopped: false, revision: this.revision });
-    }
-    for (const [id, thread] of this.threads) {
-      if ((all || id === threadId) && thread.revision <= before) {
-        thread.stopped = false;
-        thread.details = undefined;
-        thread.revision = this.revision;
-      }
-    }
-    this.updateState();
-  }
-
-  /** 抽取 state === "terminated" 判定，保留介于 await 之间仍能收窄 state 类型的能力。 */
-  private isTerminated(): this is { state: "terminated" } {
-    return this.state === "terminated";
-  }
-
-  // -- 内部：变量展开 -------------------------------------------------------
-
-  /** 在共享预算内递归展开变量引用，并阻止沿当前路径形成循环引用。 */
-  private async expand(
-    reference: number,
-    depth: number,
-    maxChildren: number,
-    budget: VariableBudget,
-    ancestors: Set<number>,
-    signal?: AbortSignal,
-  ): Promise<VariableView[]> {
-    if (!reference || depth === 0 || ancestors.has(reference)) return [];
-    const limit = Math.min(maxChildren, budget.remaining);
-    // 多取一个元素即可判断是否仍有子项，同时避免 Adapter 构造不会进入结果的大型变量列表。
-    const result = await this.request(
-      "variables",
-      {
-        variablesReference: reference,
+    const total = stackResponse.body.totalFrames;
+    const stackNextStart =
+      (total !== undefined && frames.length < total) || (total === undefined && frames.length === 20)
+        ? frames.length
+        : undefined;
+    const sourcePath = selectedFrame.data.source?.path;
+    const sourceContext = sourcePath ? await this.readSourceContext(sourcePath, selectedFrame.data.line) : undefined;
+    this.assertThreadRevision(thread.id, revision);
+    return {
+      thread: toThreadSnapshot(thread),
+      stack: {
         start: 0,
-        count: limit + 1,
+        items: frames,
+        ...(total !== undefined ? { total } : {}),
+        ...(stackNextStart !== undefined ? { nextStart: stackNextStart } : {}),
       },
+      selection: {
+        frame: selectedFrame,
+        scopes: scopes,
+        ...(selected && page
+          ? {
+              variables: {
+                threadId: thread.id,
+                container: { kind: "scope", frameIndex: options.frame, scope: selected },
+                variables: {
+                  start: 0,
+                  items: page.variables,
+                  ...(page.nextStart !== undefined ? { nextStart: page.nextStart } : {}),
+                },
+              },
+            }
+          : {}),
+        ...(sourceContext ? { sourceContext } : {}),
+      },
+    };
+  }
+
+  // Lifecycle and configuration
+
+  private beginClose(reason: SessionEndReason): Promise<void> {
+    if (this.closePromise) return this.closePromise;
+    // Publish the promise before abort/notifications can reenter close().
+    this.closePromise = Promise.resolve().then(() => this.closeOnce(reason));
+    this.state = { state: "closing", reason };
+    this.lifetime.abort(new Error("Debug session is closing."));
+    this.notifyChange();
+    return this.closePromise;
+  }
+
+  private async closeOnce(reason: SessionEndReason): Promise<void> {
+    const errors: string[] = [];
+    // Await only resource acquisition: start() itself waits for this cleanup on failure.
+    await this.transportStart?.catch(() => undefined);
+
+    // DAP forbids further requests before the initialize response, even during startup cancellation.
+    if (this.initializeCompleted && !this.adapterExited) {
+      const args: DebugProtocol.DisconnectArguments = {};
+      if (this.capabilities.supportTerminateDebuggee) {
+        args.terminateDebuggee = reason.kind !== "terminated" && this.configuration.request === "launch";
+      }
+      try {
+        await this.sendRequest("disconnect", args, reason.kind === "error" ? 200 : DISCONNECT_TIMEOUT_MS);
+      } catch {
+        // Local resource cleanup remains authoritative if graceful disconnect fails.
+      }
+    }
+    try {
+      await this.adapter.stopSession();
+    } catch (error) {
+      errors.push(`stopSession: ${errorMessage(error)}`);
+    }
+    try {
+      this.adapter.dispose();
+    } catch (error) {
+      errors.push(`dispose: ${errorMessage(error)}`);
+    }
+    this.state = {
+      state: "closed",
+      reason,
+      ...(errors.length ? { cleanupError: errors.join("; ") } : {}),
+    };
+    this.notifyChange();
+  }
+
+  private async configure(breakpoints: readonly SourceBreakpoints[], signal: AbortSignal): Promise<BreakpointSet[]> {
+    signal.throwIfAborted();
+    const byFile = new Map<string, Set<number>>();
+    for (const source of breakpoints) {
+      const path = resolve(this.cwd, source.file);
+      const lines = byFile.get(path) ?? new Set<number>();
+      source.lines.forEach((line) => lines.add(line));
+      byFile.set(path, lines);
+    }
+    const supportsConfigurationDone = this.capabilities.supportsConfigurationDoneRequest === true;
+    let configurationFailed = false;
+    try {
+      const sourceBreakpoints = Promise.all(
+        [...byFile].map(async ([file, lines]) => ({
+          source: { path: file },
+          breakpoints: await this.sendBreakpoints(file, [...lines], signal),
+        })),
+      );
+      if (supportsConfigurationDone) {
+        const [results] = await Promise.all([
+          sourceBreakpoints,
+          this.capabilities.exceptionBreakpointFilters?.length
+            ? this.request("setExceptionBreakpoints", { filters: [] }, START_TIMEOUT_MS, signal)
+            : undefined,
+        ]);
+        return results;
+      }
+      const results = await sourceBreakpoints;
+      // Legacy adapters use the last exception-breakpoint request as the configuration barrier.
+      await this.request("setExceptionBreakpoints", { filters: [] }, START_TIMEOUT_MS, signal);
+      return results;
+    } catch (error) {
+      configurationFailed = true;
+      throw error;
+    } finally {
+      // Complete the handshake even if a breakpoint request failed, unless closure/cancellation has begun.
+      if (supportsConfigurationDone && !signal.aborted) {
+        try {
+          await this.request("configurationDone", {}, START_TIMEOUT_MS, signal);
+        } catch (error) {
+          // A secondary handshake failure must not replace the original configuration error.
+          if (!configurationFailed) throw error;
+        }
+      }
+    }
+  }
+
+  // Breakpoints
+
+  private async sendBreakpoints(
+    file: string,
+    lines: readonly number[],
+    signal?: AbortSignal,
+  ): Promise<DebugProtocol.Breakpoint[]> {
+    const path = resolve(this.cwd, file);
+    const requested = [...new Set(lines)].sort((a, b) => a - b);
+    const response = await this.request(
+      "setBreakpoints",
+      {
+        source: { path },
+        breakpoints: requested.map((line) => ({ line })),
+      },
+      REQUEST_TIMEOUT_MS,
       signal,
     );
-    const all = result?.variables ?? [];
-    const selected = all.slice(0, limit);
-    if (selected.length < all.length) budget.truncated = true;
-    budget.remaining -= selected.length;
-    const path = new Set(ancestors).add(reference);
-    const values: VariableView[] = [];
-    /** 按单值上限和共享字符预算截断变量文本。 */
-    const text = (input: string, maximum: number): string => {
-      const result = input.slice(0, Math.min(maximum, budget.characters));
-      budget.characters -= result.length;
-      if (result.length < input.length) budget.truncated = true;
+    return response.body.breakpoints;
+  }
+
+  // Execution and waiting
+
+  private async resume(
+    command: "continue" | "next" | "stepIn" | "stepOut",
+    options: ResumeOptions,
+    signal?: AbortSignal,
+  ): Promise<ExecutionOutcome> {
+    this.assertActive();
+    let baseline = this.revision;
+    let threadId = 0;
+
+    await this.withMutation(async () => {
+      this.assertActive();
+      if (options.singleThread && !this.capabilities.supportsSingleThreadExecutionRequests) {
+        throw new Error("The debug adapter does not support single-thread execution requests.");
+      }
+      const thread = await this.selectStoppedThread(options.threadId, signal);
+      threadId = thread.id;
+      baseline = this.revision;
+      const threadRevision = thread.executionRevision;
+      const response = await this.request(
+        command,
+        { threadId, singleThread: options.singleThread },
+        REQUEST_TIMEOUT_MS,
+        signal,
+      );
+
+      this.assertActive();
+      const currentThread = this.threadsById.get(threadId);
+      if (currentThread?.state === "stopped" && currentThread.executionRevision === threadRevision) {
+        const responseAllThreads = (response.body as { allThreadsContinued?: boolean } | undefined)
+          ?.allThreadsContinued;
+        this.markContinued(threadId, responseAllThreads ?? !options.singleThread);
+      }
+    }).catch((error: unknown) => {
+      signal?.throwIfAborted();
+      if (!this.lifetime.signal.aborted || error !== this.lifetime.signal.reason) throw error;
+    });
+
+    return this.waitAfter(baseline, { threadId, waitMs: options.waitMs }, signal);
+  }
+
+  private async waitAfter(baseline: number, options: WaitOptions, signal?: AbortSignal): Promise<ExecutionOutcome> {
+    const deadline = Date.now() + options.waitMs;
+    while (true) {
+      signal?.throwIfAborted();
+      const outcome = this.findWaitOutcome(baseline, options.threadId);
+      if (outcome) {
+        const enriched = await this.enrichExecutionResult(outcome, signal);
+        if (outcome.kind !== "stopped" || !this.lifetime.signal.aborted) return enriched;
+        continue;
+      }
+      if (options.waitMs === 0 || Date.now() >= deadline) return { kind: "timeout", status: this.snapshot() };
+      await this.waitForChange(deadline - Date.now(), signal);
+    }
+  }
+
+  private findWaitOutcome(baseline: number, threadId?: number): ExecutionOutcome | undefined {
+    if (this.isClosed) return { kind: "closed", status: this.snapshot() };
+    if (this.state.state === "closing") return undefined;
+
+    if (threadId !== undefined) {
+      const thread = this.threadsById.get(threadId);
+      if (thread && thread.lastRevision > baseline) {
+        if (thread.state === "stopped") return { kind: "stopped", thread: toThreadSnapshot(thread) };
+        if (thread.state === "exited") return { kind: "threadExited", threadId };
+      }
+      return undefined;
+    }
+
+    if (this.lastStop && this.lastStop.revision > baseline) {
+      const thread = this.lastStop.threadId === undefined ? undefined : this.threadsById.get(this.lastStop.threadId);
+      if (thread) return { kind: "stopped", thread: toThreadSnapshot(thread) };
+    }
+    return undefined;
+  }
+
+  private async enrichExecutionResult(result: ExecutionOutcome, signal?: AbortSignal): Promise<ExecutionOutcome> {
+    if (result.kind !== "stopped" || !result.thread.stop) return result;
+
+    try {
+      const response = await this.request(
+        "stackTrace",
+        { threadId: result.thread.id, startFrame: 0, levels: 1 },
+        REQUEST_TIMEOUT_MS,
+        signal,
+      );
+      const data = response.body.stackFrames[0];
+      if (!data) return result;
+      return { ...result, thread: { ...result.thread, stop: { ...result.thread.stop, topFrame: { index: 0, data } } } };
+    } catch {
+      signal?.throwIfAborted();
       return result;
-    };
-    for (const item of selected) {
-      if (budget.characters <= 0) {
-        budget.truncated = true;
-        break;
+    }
+  }
+
+  private waitForChange(timeoutMs: number, signal?: AbortSignal): Promise<void> {
+    return new Promise<void>((resolvePromise, rejectPromise) => {
+      if (signal?.aborted) {
+        rejectPromise(abortError(signal));
+        return;
       }
-      const value: VariableView = {
-        name: text(item.name, 200),
-        value: text(item.value, 2000),
-        type: item.type === undefined ? undefined : text(item.type, 200),
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const done = (): void => {
+        cleanup();
+        resolvePromise();
       };
-      if (item.variablesReference > 0) {
-        value.expandable = true;
-        if (depth > 1 && budget.remaining > 0 && budget.characters > 0 && !path.has(item.variablesReference)) {
-          value.children = await this.expand(item.variablesReference, depth - 1, maxChildren, budget, path, signal);
-        } else budget.truncated = true;
-      }
-      values.push(value);
-    }
-    return values;
-  }
-
-  // -- 内部：事件处理 -------------------------------------------------------
-
-  /** 将 DAP 事件归并到本地会话状态，并通知所有等待者重新检查条件。 */
-  private onEvent(event: DebugProtocol.Event): void {
-    switch (event.event) {
-      case "initialized":
-        this.initialized = true;
-        break;
-      case "stopped": {
-        if (this.state === "terminated") break;
-        this.stopRevision = ++this.revision;
-        const details = event.body as DebugProtocol.StoppedEvent["body"];
-        if (details.allThreadsStopped) {
-          this.allStopped = true;
-          this.defaultStopped = true;
-          this.allStoppedRevision = this.revision;
-          // 其它线程未在事件中被具体命名，只标记停止；保留 reason 便于 listThreads 提示，
-          // 但清掉 description/hitBreakpointIds 等只属于命名线程的 stale 字段。
-          for (const [id, thread] of this.threads) {
-            if (id === details.threadId) continue;
-            thread.stopped = true;
-            thread.revision = this.revision;
-            if (thread.details) thread.details = { reason: thread.details.reason };
-          }
-        }
-        if (details.threadId !== undefined) {
-          this.threads.set(details.threadId, {
-            ...this.threads.get(details.threadId),
-            stopped: true,
-            details,
-            revision: this.revision,
-            stoppedAt: this.revision,
-          });
-          this.exitedThreads.delete(details.threadId);
-          this.selectedThread = details.threadId;
-        }
-        this.updateState();
-        break;
-      }
-      case "continued": {
-        if (this.state === "terminated") break;
-        this.revision++;
-        const body = event.body as DebugProtocol.ContinuedEvent["body"];
-        this.continued(body.threadId, body.allThreadsContinued === true);
-        if (body.allThreadsContinued === true) this.allContinuedRevision = this.revision;
-        else {
-          const thread = this.threads.get(body.threadId);
-          if (thread) thread.continuedRevision = this.revision;
-        }
-        break;
-      }
-      case "thread": {
-        if (this.state === "terminated") break;
-        const body = event.body as DebugProtocol.ThreadEvent["body"];
-        this.revision++;
-        if (body.reason === "exited") {
-          this.threads.delete(body.threadId);
-          this.exitedThreads.add(body.threadId);
-        } else if (body.reason === "started") {
-          // started 只确认线程存在，不保证 Adapter 已恢复该线程。
-          if (!this.threads.has(body.threadId)) this.threads.set(body.threadId, { revision: this.revision });
-          this.exitedThreads.delete(body.threadId);
-          this.allStopped = false;
-        }
-        this.updateState();
-        break;
-      }
-      case "terminated":
-        this.markTerminated();
-        // terminated 结束调试会话，但 Adapter 可能仍在等待 disconnect 才会退出。
-        void this.close(false).catch((error) => {
-          this.failure = error instanceof Error ? error.message : String(error);
-        });
-        break;
-      case "exited":
-        this.exitCode = (event.body as DebugProtocol.ExitedEvent["body"]).exitCode;
-        break;
-      case "output":
-        this.appendOutput((event.body as DebugProtocol.OutputEvent["body"]).output);
-        break;
-      case "capabilities":
-        Object.assign(this.capabilities, (event.body as DebugProtocol.CapabilitiesEvent["body"]).capabilities);
-        break;
-      case "invalidated":
-        // 本会话不缓存栈帧或变量；推进 revision 即可使正在读取的旧快照失败，后续查询会重新拉取。
-        if (this.state !== "terminated") this.revision++;
-        break;
-    }
-    this.changes.emit("change");
-  }
-
-  /** 追加 Adapter 输出，并仅保留最新的限定长度内容。 */
-  private appendOutput(text: string): void {
-    if (this.output.length + text.length > 16000) this.outputTruncated = true;
-    this.output = (this.output + text).slice(-16000);
-  }
-
-  // -- 内部：等待原语 -------------------------------------------------------
-
-  /** 等待谓词成立、会话终止、调用取消或超时，并在结束时移除监听器。 */
-  private async waitUntil(predicate: () => boolean, timeout: number, signal?: AbortSignal): Promise<void> {
-    signal?.throwIfAborted();
-    if (predicate() || this.state === "terminated" || timeout === 0) return;
-    await new Promise<void>((resolve, reject) => {
-      const cleanup = () => {
-        clearTimeout(timer);
-        this.changes.off("change", changed);
+      const aborted = (): void => {
+        cleanup();
+        rejectPromise(abortError(signal));
+      };
+      const cleanup = (): void => {
+        if (timer) clearTimeout(timer);
+        this.changeListeners.delete(done);
         signal?.removeEventListener("abort", aborted);
       };
-      const done = () => {
-        cleanup();
-        resolve();
-      };
-      const changed = () => {
-        if (predicate() || this.state === "terminated") done();
-      };
-      const aborted = () => {
-        cleanup();
-        reject(signal?.reason ?? new Error("Debug operation aborted."));
-      };
-      const timer = setTimeout(done, timeout);
-      this.changes.on("change", changed);
+      this.changeListeners.add(done);
       signal?.addEventListener("abort", aborted, { once: true });
+      timer = setTimeout(done, Math.max(0, timeoutMs));
     });
   }
 
-  /** 等待目标线程或整个会话停止、终止，或到达超时。 */
-  private async waitForStop(threadId: number | undefined, timeout: number, signal?: AbortSignal, after?: number) {
-    const outcome = () => {
-      if (this.state === "terminated") return "terminated";
-      if (threadId !== undefined && this.exitedThreads.has(threadId)) return "thread_exited";
-      const stopped =
-        after !== undefined
-          ? this.stopRevision > after
-          : threadId === undefined
-            ? this.state === "stopped"
-            : this.threads.get(threadId)?.stopped;
-      if (stopped) return "stopped";
-      return undefined;
-    };
-    await this.waitUntil(() => outcome() !== undefined, timeout, signal);
-    const waitOutcome = outcome() ?? "timeout";
-    if (this.state === "terminated") await this.close(false);
-    return { waitOutcome, waitedThreadId: threadId };
+  // Thread selection and inspection
+
+  private async fetchThreads(signal?: AbortSignal): Promise<Thread[]> {
+    const response = await this.request("threads", {}, REQUEST_TIMEOUT_MS, signal);
+    this.assertActive();
+    const activeIds = new Set(response.body.threads.map((thread) => thread.id));
+    let removedThread = false;
+    for (const thread of this.threadsById.values()) {
+      if (thread.state === "exited" || activeIds.has(thread.id)) continue;
+      const revision = ++this.revision;
+      thread.state = "exited";
+      thread.executionRevision++;
+      thread.lastRevision = revision;
+      thread.stop = undefined;
+      removedThread = true;
+    }
+    for (const value of response.body.threads) {
+      const existing = this.threadsById.get(value.id);
+      if (existing) {
+        existing.name = value.name;
+        if (
+          this.allThreadsStoppedRevision !== undefined &&
+          existing.lastRevision < this.allThreadsStoppedRevision &&
+          existing.state !== "exited"
+        ) {
+          existing.state = "stopped";
+          existing.stop = this.lastStop?.details;
+        }
+      } else {
+        const coveredByAllThreadsStop = this.allThreadsStoppedRevision !== undefined;
+        this.threadsById.set(value.id, {
+          id: value.id,
+          name: value.name,
+          state: coveredByAllThreadsStop ? "stopped" : "unknown",
+          executionRevision: 0,
+          lastRevision: 0,
+          ...(coveredByAllThreadsStop ? { stop: this.lastStop?.details } : {}),
+        });
+      }
+    }
+    if (removedThread) this.notifyChange();
+    return [...this.threadsById.values()]
+      .filter((thread) => thread.state !== "exited" && activeIds.has(thread.id))
+      .sort((a, b) => a.id - b.id);
   }
+
+  private async selectStoppedThread(threadId: number | undefined, signal?: AbortSignal): Promise<Thread> {
+    let stopped = [...this.threadsById.values()].filter((thread) => thread.state === "stopped");
+    if (stopped.length === 0 || (threadId !== undefined && !this.threadsById.has(threadId))) {
+      await this.fetchThreads(signal);
+      stopped = [...this.threadsById.values()].filter((thread) => thread.state === "stopped");
+    }
+
+    if (threadId !== undefined) {
+      const thread = this.threadsById.get(threadId);
+      if (!thread) throw new Error(`Unknown thread ${threadId}.`);
+      if (thread.state !== "stopped") throw new Error(`Thread ${threadId} is not stopped.`);
+      return thread;
+    }
+
+    if (this.lastStoppedThreadId !== undefined) {
+      const recent = this.threadsById.get(this.lastStoppedThreadId);
+      if (recent?.state === "stopped") return recent;
+    }
+    if (stopped.length === 1) return stopped[0];
+    if (stopped.length === 0) throw new Error("No stopped thread is available.");
+    throw new Error("Multiple threads are stopped; provide threadId.");
+  }
+
+  private async selectRunningThread(threadId: number | undefined, signal?: AbortSignal): Promise<number> {
+    const threads = await this.fetchThreads(signal);
+    if (threadId !== undefined) {
+      const thread = this.threadsById.get(threadId);
+      if (!thread) throw new Error(`Unknown thread ${threadId}.`);
+      if (thread.state === "stopped") throw new Error(`Thread ${threadId} is already stopped.`);
+      return threadId;
+    }
+    const running = threads.filter((thread) => thread.state !== "stopped");
+    if (running.length === 1) return running[0].id;
+    if (running.length === 0) throw new Error("No running thread is available.");
+    throw new Error("Multiple threads can be paused; provide threadId.");
+  }
+
+  private async resolveFrame(
+    threadId: number,
+    frameIndex: number,
+    revision: number,
+    signal?: AbortSignal,
+  ): Promise<DebugProtocol.StackFrame> {
+    const response = await this.request(
+      "stackTrace",
+      { threadId, startFrame: frameIndex, levels: 1 },
+      REQUEST_TIMEOUT_MS,
+      signal,
+    );
+    this.assertThreadRevision(threadId, revision);
+    const frame = response.body.stackFrames[0];
+    if (!frame) throw new Error(`Stack frame ${frameIndex} does not exist on thread ${threadId}.`);
+    return frame;
+  }
+
+  private async resolveScope(
+    frameId: number,
+    requestedName: string,
+    threadId: number,
+    revision: number,
+    signal?: AbortSignal,
+  ): Promise<DebugProtocol.Scope> {
+    const response = await this.request("scopes", { frameId }, REQUEST_TIMEOUT_MS, signal);
+    this.assertThreadRevision(threadId, revision);
+    const requested = requestedName.toLocaleLowerCase();
+    const scope = response.body.scopes.find((candidate) => candidate.name.toLocaleLowerCase() === requested);
+    if (scope) return scope;
+    const available = response.body.scopes.map((candidate) => candidate.name).join(", ");
+    throw new Error(`Scope '${requestedName}' is not available. Available scopes: ${available || "none"}.`);
+  }
+
+  private selectInspectScope(
+    scopes: readonly DebugProtocol.Scope[],
+    requestedName: string | undefined,
+  ): DebugProtocol.Scope | undefined {
+    if (requestedName !== undefined) {
+      const requested = requestedName.toLocaleLowerCase();
+      const scope = scopes.find((candidate) => candidate.name.toLocaleLowerCase() === requested);
+      if (scope) return scope;
+      const available = scopes.map((candidate) => candidate.name).join(", ");
+      throw new Error(`Scope '${requestedName}' is not available. Available scopes: ${available || "none"}.`);
+    }
+    return (
+      scopes.find((scope) => scope.presentationHint === "locals") ??
+      scopes.find((scope) => scope.name.toLocaleLowerCase() === "locals") ??
+      scopes.find((scope) => !scope.expensive) ??
+      scopes[0]
+    );
+  }
+
+  private async readSourceContext(path: string, line: number): Promise<SourceContext | undefined> {
+    try {
+      const lines = (await readFile(path, "utf8")).split(/\r?\n/);
+      const startLine = Math.max(1, line - 2);
+      return {
+        path,
+        lines: lines
+          .slice(startLine - 1, Math.min(lines.length, line + 2))
+          .map((content, index) => ({ line: startLine + index, content })),
+      };
+    } catch {
+      return undefined;
+    }
+  }
+
+  private async readVariablesPage(
+    reference: number,
+    start: number,
+    count: number,
+    threadId: number,
+    revision: number,
+    signal?: AbortSignal,
+  ): Promise<{ variables: DebugProtocol.Variable[]; nextStart?: number }> {
+    if (reference <= 0) return { variables: [] };
+    const response = await this.request(
+      "variables",
+      { variablesReference: reference, start, count: count + 1 },
+      REQUEST_TIMEOUT_MS,
+      signal,
+    );
+    this.assertThreadRevision(threadId, revision);
+    const variables = response.body.variables.slice(0, count);
+    const nextStart = response.body.variables.length > count ? start + variables.length : undefined;
+    return { variables, ...(nextStart !== undefined ? { nextStart } : {}) };
+  }
+
+  private assertThreadRevision(threadId: number, revision: number): void {
+    this.assertActive();
+    const thread = this.threadsById.get(threadId);
+    if (!thread || thread.state !== "stopped" || thread.executionRevision !== revision) {
+      throw new Error(`Thread ${threadId} resumed or changed while it was being inspected; inspect it again.`);
+    }
+  }
+
+  // Adapter events and state transitions
+
+  private handleEvent(event: DebugProtocol.Event): void {
+    if (this.isClosed) return;
+    if (this.state.state === "closing") {
+      if (event.event !== "output" && event.event !== "exited") return;
+    }
+
+    switch (event.event) {
+      case "initialized":
+        this.initializedSeen = true;
+        this.configureOnInitialized?.();
+        break;
+      case "capabilities":
+        this.mergeCapabilities((event as DebugProtocol.CapabilitiesEvent).body.capabilities);
+        break;
+      case "output":
+        this.outputBuffer.push((event as DebugProtocol.OutputEvent).body);
+        if (this.outputBuffer.length > OUTPUT_BUFFER_LIMIT) this.outputBuffer.shift();
+        break;
+      case "stopped":
+        this.handleStopped(event as DebugProtocol.StoppedEvent);
+        break;
+      case "continued": {
+        const continued = event as DebugProtocol.ContinuedEvent;
+        this.markContinued(continued.body.threadId, continued.body.allThreadsContinued !== false);
+        break;
+      }
+      case "thread":
+        this.handleThread(event as DebugProtocol.ThreadEvent);
+        break;
+      case "invalidated":
+        this.invalidateThreads(event as DebugProtocol.InvalidatedEvent);
+        break;
+      case "exited": {
+        const exited = event as DebugProtocol.ExitedEvent;
+        this.debuggeeExit = { exitCode: exited.body.exitCode };
+        this.notifyChange();
+        break;
+      }
+      case "terminated":
+        void this.beginClose({ kind: "terminated" });
+        break;
+    }
+  }
+
+  private handleStopped(event: DebugProtocol.StoppedEvent): void {
+    const revision = ++this.revision;
+    const details: Stop = { event: { ...event.body } };
+    this.lastStop = { revision, threadId: event.body.threadId, details };
+    this.lastStoppedThreadId = event.body.threadId;
+    if (event.body.allThreadsStopped) this.allThreadsStoppedRevision = revision;
+
+    if (event.body.allThreadsStopped) {
+      for (const thread of this.threadsById.values()) this.updateStoppedThread(thread, revision, details);
+    }
+    if (event.body.threadId !== undefined) {
+      const thread = this.getOrCreateThread(event.body.threadId);
+      this.updateStoppedThread(thread, revision, details);
+    }
+    this.notifyChange();
+  }
+
+  private updateStoppedThread(thread: Thread, revision: number, details: Stop): void {
+    thread.state = "stopped";
+    thread.executionRevision++;
+    thread.lastRevision = revision;
+    thread.stop = details;
+  }
+
+  private markContinued(threadId: number, allThreads: boolean): void {
+    const revision = ++this.revision;
+    if (allThreads) this.allThreadsStoppedRevision = undefined;
+    const affected = allThreads ? [...this.threadsById.values()] : [this.getOrCreateThread(threadId)];
+    for (const thread of affected) {
+      if (thread.state === "exited") continue;
+      thread.state = "running";
+      thread.executionRevision++;
+      thread.lastRevision = revision;
+      thread.stop = undefined;
+    }
+    this.notifyChange();
+  }
+
+  private handleThread(event: DebugProtocol.ThreadEvent): void {
+    const revision = ++this.revision;
+    const thread = this.getOrCreateThread(event.body.threadId);
+    thread.executionRevision++;
+    thread.lastRevision = revision;
+    if (event.body.reason === "exited") {
+      thread.state = "exited";
+      thread.stop = undefined;
+    } else if (event.body.reason === "started" && thread.state === "exited") {
+      thread.state = "unknown";
+    }
+    this.notifyChange();
+  }
+
+  private invalidateThreads(event: DebugProtocol.InvalidatedEvent): void {
+    const revision = ++this.revision;
+    const threadIds = event.body?.threadId !== undefined ? [event.body.threadId] : [...this.threadsById.keys()];
+    for (const id of threadIds) {
+      const thread = this.threadsById.get(id);
+      if (!thread) continue;
+      thread.executionRevision++;
+      thread.lastRevision = revision;
+    }
+    this.notifyChange();
+  }
+
+  private handleReverseRequest(request: DebugProtocol.Request): void {
+    if (this.isClosed) return;
+    this.adapter.sendResponse({
+      seq: 0,
+      type: "response",
+      request_seq: request.seq,
+      command: request.command,
+      success: false,
+      message: `Reverse request '${request.command}' is not supported by pi-debug.`,
+    });
+  }
+
+  private handleAdapterError(error: Error): void {
+    void this.beginClose({ kind: "error", message: error.message });
+  }
+
+  private handleAdapterExit(code: number | null): void {
+    if (this.isClosed) return;
+    this.adapterExited = true;
+    void this.beginClose({
+      kind: "error",
+      message: `Debug adapter exited unexpectedly${code === null ? "." : ` with code ${code}.`}`,
+    });
+  }
+
+  // State and request utilities
+
+  private mergeCapabilities(capabilities: DebugProtocol.Capabilities | undefined): void {
+    if (capabilities) Object.assign(this.capabilities, capabilities);
+  }
+
+  private getOrCreateThread(id: number): Thread {
+    let thread = this.threadsById.get(id);
+    if (!thread) {
+      thread = { id, state: "unknown", executionRevision: 0, lastRevision: 0 };
+      this.threadsById.set(id, thread);
+    }
+    return thread;
+  }
+
+  private notifyChange(): void {
+    for (const listener of [...this.changeListeners]) listener();
+  }
+
+  private assertActive(): void {
+    if (this.state.state !== "active") {
+      throw new Error(`Debug session is not active; current state is '${this.state.state}'.`);
+    }
+  }
+
+  private async withMutation<T>(operation: () => Promise<T>): Promise<T> {
+    const previous = this.mutationTail;
+    let release!: () => void;
+    this.mutationTail = new Promise<void>((resolvePromise) => {
+      release = resolvePromise;
+    });
+    await previous;
+    try {
+      return await operation();
+    } finally {
+      release();
+    }
+  }
+
+  private async request<C extends DapRequestCommand>(
+    command: C,
+    args: DapRequestArguments<C>,
+    timeoutMs: number,
+    signal?: AbortSignal,
+  ): Promise<DapResponse<C>> {
+    const combined = signal ? AbortSignal.any([signal, this.lifetime.signal]) : this.lifetime.signal;
+    const response = await this.sendRequest(command, args, timeoutMs, combined);
+    combined.throwIfAborted();
+    return response;
+  }
+
+  private sendRequest<C extends DapRequestCommand>(
+    command: C,
+    args: DapRequestArguments<C>,
+    timeoutMs: number,
+    signal?: AbortSignal,
+  ): Promise<DapResponse<C>> {
+    return new Promise<DapResponse<C>>((resolvePromise, rejectPromise) => {
+      if (signal?.aborted) {
+        rejectPromise(abortError(signal));
+        return;
+      }
+      let settled = false;
+      const aborted = (): void => {
+        if (settled) return;
+        settled = true;
+        signal?.removeEventListener("abort", aborted);
+        rejectPromise(abortError(signal));
+      };
+      signal?.addEventListener("abort", aborted, { once: true });
+      try {
+        this.adapter.sendRequest(
+          command,
+          args,
+          (response) => {
+            if (settled) return;
+            settled = true;
+            signal?.removeEventListener("abort", aborted);
+            if (!response.success) {
+              rejectPromise(new Error(formatResponseError(response)));
+              return;
+            }
+            resolvePromise(response as DapResponse<C>);
+          },
+          timeoutMs,
+        );
+      } catch (error) {
+        settled = true;
+        signal?.removeEventListener("abort", aborted);
+        rejectPromise(error);
+      }
+    });
+  }
+}
+
+function abortError(signal?: AbortSignal): Error {
+  return signal?.reason instanceof Error ? signal.reason : new Error("Operation aborted.");
+}
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, operation: string, signal: AbortSignal): Promise<T> {
+  return new Promise<T>((resolvePromise, rejectPromise) => {
+    signal.throwIfAborted();
+    const cleanup = (): void => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", aborted);
+    };
+    const aborted = (): void => {
+      cleanup();
+      rejectPromise(abortError(signal));
+    };
+    const timer = setTimeout(() => {
+      cleanup();
+      rejectPromise(new Error(`Timed out waiting for ${operation}.`));
+    }, timeoutMs);
+    signal.addEventListener("abort", aborted, { once: true });
+    promise.then(
+      (value) => {
+        cleanup();
+        resolvePromise(value);
+      },
+      (error) => {
+        cleanup();
+        rejectPromise(error);
+      },
+    );
+  });
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function formatResponseError(response: DebugProtocol.Response): string {
+  const errorResponse = response as DebugProtocol.ErrorResponse;
+  const error = errorResponse.body?.error;
+  if (!error) return response.message || `Debug adapter rejected '${response.command}'.`;
+
+  return error.format.replace(/{([^{}]+)}/g, (placeholder, name: string) => error.variables?.[name] ?? placeholder);
+}
+
+function toThreadSnapshot(thread: Thread): ThreadSnapshot {
+  return {
+    id: thread.id,
+    ...(thread.name ? { name: thread.name } : {}),
+    state: thread.state,
+    ...(thread.stop ? { stop: thread.stop } : {}),
+  };
 }
