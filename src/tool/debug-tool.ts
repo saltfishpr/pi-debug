@@ -1,295 +1,177 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
+import { DebugError, throwIfAborted } from "../debug/errors.js";
 import type { DebugSessionManager } from "../debug/session-manager.js";
-import { debugParameters, type DebugArguments } from "./schema.js";
-import * as view from "./view.js";
+import type { VariablesSelection } from "../debug/types.js";
+import { parameters } from "./schema.js";
+import {
+  errorText,
+  formatConfigurationsResult,
+  formatEvaluateResult,
+  formatExecutionOutcome,
+  formatOutputResult,
+  formatSessionSnapshot,
+  formatSetBreakpointsResult,
+  formatStackTraceResult,
+  formatStartResult,
+  formatStopResult,
+  formatThreadSnapshots,
+  formatVariablesResult,
+  resultText,
+} from "./view.js";
 
+/** Register the session-backed debug tool and its compact call renderer. */
 export function registerDebugTool(pi: ExtensionAPI, manager: DebugSessionManager): void {
   pi.registerTool({
     name: "debug",
     label: "Debug",
     description: [
-      "Control program execution and inspect runtime state through one debug session that persists across calls; only one session can be active at a time.",
-      "Start with a saved configuration name from `configurations` or an inline launch/attach configuration. All other actions require an existing session; `status`, `output`, `wait`, and `stop` also accept a retained closed session.",
-      "Execution-control actions return after observing a stop, selected thread exit, or completed session closure, or when their event-wait budget expires. A timeout reports current session state but does not pause the debuggee or cancel the dispatched operation. `wait` observes new thread events, but returns immediately for an already closed session. Program exit alone does not imply session closure; `closing` means cleanup is still in progress, and `cleanupError` in the closed state reports cleanup failure.",
-      "Stack, variable, evaluation, and inspection actions require a stopped thread, but other threads and shared state may continue changing. `evaluate` runs code in the debuggee and may have side effects.",
-      "`stop` closes and forgets the session. It may terminate a launched program; disconnecting from an attached program leaves that program running.",
+      "Manage one program debugging session at a time. Use `configurations` to find saved launch settings, then `start` with a saved name or an inline launch/attach configuration; a new session requires the previous one to be closed.",
+      "In an active session, set breakpoints, control execution, inspect stopped threads, or evaluate expressions. `status` reports the session state, `wait` observes stops or exits without controlling execution, `output` reads buffered output, and `stop` requests cleanup.",
+      "Execution controls may return after an observation timeout without stopping the program. `stop` may return while cleanup is still in progress and may terminate a launched program; evaluating expressions can change target state.",
     ].join(" "),
     promptSnippet:
-      "Debug running programs by controlling execution and inspecting runtime state when static analysis is insufficient.",
+      "Debug programs by controlling execution and inspecting runtime evidence when static analysis is insufficient.",
     promptGuidelines: [
-      "Before using `debug`, state a concrete hypothesis and place breakpoints that can confirm or refute it; prefer targeted stops to repeated single-stepping.",
-      "After `debug` reports a stop, use `inspect` for a bounded overview; use `stack_trace`, `variables`, or `evaluate` directly when the required thread, frame, scope, or expression is already known.",
-      "Read the execution outcome from `debug` before inspecting or resuming. After a timeout, use `status` to reassess the session and `wait` for another event if needed; do not repeat the execution action merely because its wait budget expired.",
-      "Keep `debug` execution-control calls sequential, and finish collecting evidence from a stopped thread before resuming it; other threads may still change shared state.",
-      "Use read-only expressions with `debug` action `evaluate` by default; call functions or assign values only when the resulting side effects are intentional.",
-      "Call `debug` with `stop` when the investigation is complete to release debugging resources.",
+      "Use debug to test a specific runtime hypothesis: set targeted breakpoints (use `initialBreakpoints` for startup code) and inspect relevant stack frames and variables instead of repeatedly stepping without a question.",
+      "Use debug `status` or `threads` when session state or thread selection is unclear; use the stopped thread's current revision when expanding a `variablesReference`, and refresh inspection after it resumes.",
+      "Use debug `wait` or `status` after an observation timeout rather than assuming execution stopped; avoid debug `evaluate` expressions with side effects unless necessary.",
+      "Use debug `stop` when finished; if it reports `closing`, check debug `status` before starting another session.",
     ],
-    parameters: debugParameters,
+    parameters,
+
     async execute(_id, args, signal, _onUpdate, ctx) {
-      const result = await executeDebugAction(manager, args, ctx.cwd, signal);
-      return {
-        content: [{ type: "text", text: result }],
-        details: undefined, // TODO
-      };
-    },
-    renderCall(args, theme, context) {
-      const text = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
-      const action = args.action;
-      const title = theme.fg("toolTitle", theme.bold("debug "));
+      const done = (text: string, details?: unknown) => ({
+        content: [{ type: "text" as const, text }],
+        details,
+      });
 
-      if (!action) {
-        text.setText(title + theme.fg("muted", context.argsComplete ? "invalid action" : "preparing action…"));
-        return text;
+      try {
+        throwIfAborted(signal);
+
+        switch (args.action) {
+          case "configurations": {
+            const result = await manager.configurations(ctx.cwd, signal);
+            return done(resultText(formatConfigurationsResult(result)));
+          }
+          case "start": {
+            if (args.configuration === undefined) {
+              throw new DebugError("INVALID_ARGUMENT", "`start` requires `configuration`.");
+            }
+            const result = await manager.start(
+              ctx.cwd,
+              {
+                configuration: args.configuration,
+                breakpoints: args.initialBreakpoints ?? [],
+                waitMs: args.waitMs ?? 1_000,
+              },
+              signal,
+            );
+            return done(resultText(formatStartResult(result)));
+          }
+          case "stop": {
+            const result = await manager.stop();
+            return done(resultText(formatStopResult(result)));
+          }
+          case "status":
+            return done(resultText(formatSessionSnapshot(manager.get().snapshot())));
+          case "wait": {
+            const result = await manager
+              .get()
+              .wait({ threadId: args.threadId, revision: args.revision, waitMs: args.waitMs ?? 1_000 }, signal);
+            return done(resultText(formatExecutionOutcome(result)));
+          }
+          case "continue":
+          case "next":
+          case "step_in":
+          case "step_out":
+          case "pause": {
+            const result = await manager.get().execute(
+              args.action,
+              {
+                threadId: args.threadId,
+                singleThread: "singleThread" in args ? args.singleThread : undefined,
+                waitMs: args.waitMs ?? 1_000,
+              },
+              signal,
+            );
+            return done(resultText(formatExecutionOutcome(result)));
+          }
+          case "set_breakpoints": {
+            if (args.breakpoints === undefined) {
+              throw new DebugError(
+                "INVALID_ARGUMENT",
+                "`set_breakpoints` requires one source object in `breakpoints`.",
+              );
+            }
+            const result = await manager.get().setBreakpoints(args.breakpoints, signal);
+            return done(resultText(formatSetBreakpointsResult(result)));
+          }
+          case "threads": {
+            const result = await manager.get().threads(pageOptions(args), signal);
+            return done(resultText(formatThreadSnapshots(result)));
+          }
+          case "stack_trace": {
+            const result = await manager.get().stackTrace(args, pageOptions(args, 20), signal);
+            return done(resultText(formatStackTraceResult(result)));
+          }
+          case "variables": {
+            if (args.variablesReference !== undefined) {
+              if (args.revision === undefined)
+                throw new DebugError("INVALID_ARGUMENT", "variablesReference requires revision.");
+              if (args.frameIndex !== undefined || args.scope !== undefined) {
+                throw new DebugError(
+                  "INVALID_ARGUMENT",
+                  "variablesReference cannot be combined with frameIndex or scope.",
+                );
+              }
+            }
+            const target: VariablesSelection =
+              args.variablesReference !== undefined
+                ? {
+                    threadId: args.threadId,
+                    revision: args.revision!,
+                    variablesReference: args.variablesReference,
+                  }
+                : {
+                    threadId: args.threadId,
+                    revision: args.revision,
+                    frameIndex: args.frameIndex ?? 0,
+                    scope: args.scope ?? "locals",
+                  };
+            const result = await manager.get().variables(target, pageOptions(args), signal);
+            return done(resultText(formatVariablesResult(result)));
+          }
+          case "evaluate": {
+            if (!args.expression?.trim()) {
+              throw new DebugError("INVALID_ARGUMENT", "`evaluate` requires a non-empty expression.");
+            }
+            const result = await manager
+              .get()
+              .evaluate(
+                { threadId: args.threadId, revision: args.revision, frameIndex: args.frameIndex ?? 0 },
+                args.expression,
+                signal,
+              );
+            return done(resultText(formatEvaluateResult(result)));
+          }
+          case "output":
+            return done(formatOutputResult(manager.get().output({ ...pageOptions(args), category: args.category })));
+        }
+      } catch (error) {
+        // Pi only marks thrown execute errors as failed tool results.
+        throw new Error(errorText(error, args.action), { cause: error });
       }
+    },
 
-      text.setText(title + theme.fg("accent", action) + theme.fg("dim", describeDebugAction(args)));
+    renderCall(args, theme, context) {
+      const text = context.lastComponent instanceof Text ? context.lastComponent : new Text("", 0, 0);
+      text.setText(theme.fg("toolTitle", theme.bold("debug ")) + theme.fg("muted", args.action ?? ""));
       return text;
     },
   });
 }
 
-function describeDebugAction(args: DebugArguments): string {
-  switch (args.action) {
-    case "configurations":
-    case "stop":
-    case "status":
-      return "";
-    case "start": {
-      const breakpoints = args.breakpoints?.reduce((total, item) => total + item.lines.length, 0) ?? 0;
-      return details(
-        formatConfiguration(args.configuration),
-        breakpoints > 0 && `breakpoints=${breakpoints}`,
-        wait(args),
-      );
-    }
-    case "set_breakpoints":
-      return details(args.file, `lines=${args.lines?.join(",") || "none"}`);
-    case "continue":
-    case "next":
-    case "step_in":
-    case "step_out":
-      return details(thread(args), args.singleThread && "single-thread", wait(args));
-    case "pause":
-      return details(thread(args), wait(args));
-    case "wait":
-      return details(thread(args), wait(args));
-    case "threads":
-      return details(`offset=${args.start ?? 0}`, `count=${args.count ?? 50}`);
-    case "stack_trace":
-      return details(thread(args), `offset=${args.start ?? 0}`, `count=${args.count ?? 20}`);
-    case "variables":
-      return details(
-        thread(args),
-        args.variablesReference !== undefined
-          ? `reference=${args.variablesReference}`
-          : `frame=${args.frame ?? 0} · scope=${args.scope ?? "locals"}`,
-        `offset=${args.start ?? 0}`,
-        `count=${args.count ?? 50}`,
-      );
-    case "evaluate":
-      return details(quote(args.expression ?? "…"), thread(args), `frame=${args.frame ?? 0}`);
-    case "output":
-      return details(
-        args.category && `category=${args.category}`,
-        `offset=${args.start ?? 0}`,
-        `count=${args.count ?? 50}`,
-      );
-    case "inspect":
-      return details(thread(args), `frame=${args.frame ?? 0}`, args.scope && `scope=${args.scope}`);
-  }
-}
-
-function formatConfiguration(configuration: DebugArguments["configuration"]): string | undefined {
-  if (typeof configuration === "string") return quote(configuration);
-  if (!configuration) return undefined;
-  return `${quote(configuration.name)} · ${configuration.type}/${configuration.request}`;
-}
-
-function thread(args: DebugArguments): string | false {
-  return args.threadId !== undefined && `thread=${args.threadId}`;
-}
-
-function wait(args: DebugArguments): string {
-  return `wait=${args.waitMs ?? 1_000}ms`;
-}
-
-function details(...parts: Array<string | false | undefined>): string {
-  const visible = parts.filter((part): part is string => Boolean(part));
-  return visible.length > 0 ? ` — ${visible.join(" · ")}` : "";
-}
-
-function quote(value: string): string {
-  const limit = 100;
-  const display = value.length > limit ? `${value.slice(0, limit - 1)}…` : value;
-  return JSON.stringify(display);
-}
-
-async function executeDebugAction(
-  manager: DebugSessionManager,
-  args: DebugArguments,
-  cwd: string,
-  signal?: AbortSignal,
-): Promise<string> {
-  switch (args.action) {
-    case "configurations": {
-      const result = await manager.configurations(cwd);
-      return view.formatConfigurationsResult(result);
-    }
-    case "start": {
-      const result = await manager.start(
-        requireArgument(args.configuration, "configuration", args.action),
-        { breakpoints: args.breakpoints ?? [], waitMs: args.waitMs ?? 1_000 },
-        cwd,
-        signal,
-      );
-      return view.formatStartResult(result);
-    }
-    case "stop": {
-      const result = await manager.stop();
-      return view.formatStopResult(result);
-    }
-  }
-
-  const session = manager.getSession();
-  switch (args.action) {
-    case "status": {
-      const result = session.snapshot();
-      return view.formatStatusResult(result);
-    }
-    case "set_breakpoints": {
-      const result = await session.setBreakpoints(
-        requireArgument(args.file, "file", args.action),
-        requireArgument(args.lines, "lines", args.action),
-        signal,
-      );
-      return view.formatSetBreakpointsResult(result);
-    }
-    case "continue": {
-      const result = await session.continue(resumeOptions(args), signal);
-      return view.formatContinueResult(result);
-    }
-    case "next": {
-      const result = await session.next(resumeOptions(args), signal);
-      return view.formatNextResult(result);
-    }
-    case "step_in": {
-      const result = await session.stepIn(resumeOptions(args), signal);
-      return view.formatStepInResult(result);
-    }
-    case "step_out": {
-      const result = await session.stepOut(resumeOptions(args), signal);
-      return view.formatStepOutResult(result);
-    }
-    case "pause": {
-      const result = await session.pause({ threadId: args.threadId, waitMs: args.waitMs ?? 1_000 }, signal);
-      return view.formatPauseResult(result);
-    }
-    case "wait": {
-      const result = await session.wait({ threadId: args.threadId, waitMs: args.waitMs ?? 1_000 }, signal);
-      return view.formatWaitResult(result);
-    }
-    case "threads": {
-      const result = await session.threads({ start: args.start ?? 0, count: args.count ?? 50 }, signal);
-      return view.formatThreadsResult(result);
-    }
-    case "stack_trace": {
-      const result = await session.stackTrace(
-        { threadId: args.threadId, start: args.start ?? 0, count: args.count ?? 20 },
-        signal,
-      );
-      return view.formatStackTraceResult(result);
-    }
-    case "variables": {
-      const result = await session.variables(variablesOptions(args), signal);
-      return view.formatVariablesResult(result);
-    }
-    case "evaluate": {
-      const result = await session.evaluate(
-        {
-          threadId: args.threadId,
-          frame: args.frame ?? 0,
-          expression: requireArgument(args.expression, "expression", args.action),
-        },
-        signal,
-      );
-      return view.formatEvaluateResult(result);
-    }
-    case "output": {
-      const result = session.output({
-        ...(args.category !== undefined ? { category: args.category } : {}),
-        start: args.start ?? 0,
-        count: args.count ?? 50,
-      });
-      return view.formatOutputResult(result);
-    }
-    case "inspect": {
-      const result = await session.inspect(inspectOptions(args), signal);
-      return view.formatInspectResult(result);
-    }
-  }
-}
-
-function resumeOptions(args: DebugArguments): {
-  threadId?: number;
-  singleThread: boolean;
-  waitMs: number;
-} {
-  return {
-    threadId: args.threadId,
-    singleThread: args.singleThread ?? false,
-    waitMs: args.waitMs ?? 1_000,
-  };
-}
-
-function variablesOptions(args: DebugArguments):
-  | {
-      threadId?: number;
-      variablesReference: number;
-      start: number;
-      count: number;
-    }
-  | {
-      threadId?: number;
-      variablesReference?: undefined;
-      frame: number;
-      scope: string;
-      start: number;
-      count: number;
-    } {
-  if (args.variablesReference !== undefined) {
-    if (args.frame !== undefined || args.scope !== undefined) {
-      throw new Error("variablesReference cannot be combined with frame or scope.");
-    }
-    return {
-      threadId: args.threadId,
-      variablesReference: args.variablesReference,
-      start: args.start ?? 0,
-      count: args.count ?? 50,
-    };
-  }
-  return {
-    threadId: args.threadId,
-    frame: args.frame ?? 0,
-    scope: args.scope ?? "locals",
-    start: args.start ?? 0,
-    count: args.count ?? 50,
-  };
-}
-
-function inspectOptions(args: DebugArguments): {
-  threadId?: number;
-  frame: number;
-  scope?: string;
-} {
-  return {
-    threadId: args.threadId,
-    frame: args.frame ?? 0,
-    ...(args.scope !== undefined ? { scope: args.scope } : {}),
-  };
-}
-
-function requireArgument<T>(value: T | undefined, name: string, action: string): T {
-  if (value === undefined) throw new Error(`Argument '${name}' is required for debug action '${action}'.`);
-  return value;
+function pageOptions(args: { start?: number; count?: number }, defaultCount = 50) {
+  return { start: args.start ?? 0, count: args.count ?? defaultCount };
 }

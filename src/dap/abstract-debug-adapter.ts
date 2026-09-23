@@ -81,7 +81,7 @@ export abstract class AbstractDebugAdapter {
             type: "response",
             request_seq: request.seq,
             success: false,
-            command,
+            command: "timeout",
             message: `Timeout after ${timeout} ms for '${command}'`,
           });
         }, timeout),

@@ -7,6 +7,7 @@ export interface DapRequestMap {
   attach: [DebugProtocol.AttachRequestArguments & Record<string, unknown>, DebugProtocol.AttachResponse];
   configurationDone: [DebugProtocol.ConfigurationDoneArguments | undefined, DebugProtocol.ConfigurationDoneResponse];
   setBreakpoints: [DebugProtocol.SetBreakpointsArguments, DebugProtocol.SetBreakpointsResponse];
+  setFunctionBreakpoints: [DebugProtocol.SetFunctionBreakpointsArguments, DebugProtocol.SetFunctionBreakpointsResponse];
   setExceptionBreakpoints: [
     DebugProtocol.SetExceptionBreakpointsArguments,
     DebugProtocol.SetExceptionBreakpointsResponse,

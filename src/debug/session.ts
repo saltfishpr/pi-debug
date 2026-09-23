@@ -1,115 +1,110 @@
 import type { DebugProtocol } from "@vscode/debugprotocol";
-import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import type { DebugConfiguration } from "../config/launch-config.js";
-import type { DapRequestMap, DebugAdapter } from "../dap";
+import type { DapRequestMap, DebugAdapter } from "../dap/index.js";
+import { finishesWithin, observe } from "./async.js";
+import { DapClient } from "./dap-client.js";
+import { abortError, DebugError, throwIfAborted } from "./errors.js";
 import type {
-  BreakpointSet,
-  DebuggeeExit,
-  EvaluateOptions,
-  Evaluation,
+  BreakpointsResult,
+  ExecuteAction,
+  ExecuteOptions,
   ExecutionOutcome,
+  FrameSelection,
   Inspection,
-  InspectOptions,
-  Output,
   OutputOptions,
   Page,
-  PaginationOptions,
-  PauseOptions,
-  ResumeOptions,
+  PageInfo,
+  PageOptions,
   SessionEndReason,
-  SessionStatus as SessionSnapshot,
-  SessionStartOptions,
+  SessionSnapshot,
   SessionState,
-  SetBreakpointsResult,
   SourceBreakpoints,
-  SourceContext,
-  StackTrace,
-  StackTraceOptions,
-  StartResult,
-  Stop,
+  StackResult,
+  StartOptions,
+  StopContext,
+  StoppedThread,
+  ThreadSelection,
   ThreadSnapshot,
   ThreadState,
-  Variables,
-  VariablesOptions,
+  VariablesResult,
+  VariablesSelection,
   WaitOptions,
 } from "./types.js";
 
 const REQUEST_TIMEOUT_MS = 10_000;
-const START_TIMEOUT_MS = 30_000;
 const DISCONNECT_TIMEOUT_MS = 2_000;
-const OUTPUT_BUFFER_LIMIT = 1_000;
+const START_CLEANUP_WAIT_MS = 5_000;
 
-interface Thread {
+interface ThreadRecord {
   id: number;
   name?: string;
   state: ThreadState;
-  executionRevision: number;
-  lastRevision: number;
-  stop?: Stop;
+  // Prevent an older response from overwriting newer evidence about this thread.
+  lastChangedRevision: number;
+  // Keep references valid across unrelated stops while this thread stays stopped.
+  stopRevision?: number;
+  stop?: DebugProtocol.StoppedEvent["body"];
 }
 
-/** One persistent Debug Adapter Protocol session and its command semantics. */
+interface StopEventRecord {
+  revision: number;
+  body: DebugProtocol.StoppedEvent["body"];
+  threadId?: number;
+}
+
+/** One DAP session, including its observed thread state and all debug operations. */
 export class DebugSession {
-  // Lifecycle and transport state
-  private state: SessionState = { state: "starting" };
-  private debuggeeExit: DebuggeeExit | undefined;
+  private readonly client: DapClient;
   private readonly lifetime = new AbortController();
-  private transportStart: Promise<void> | undefined;
-  private initializeCompleted = false;
-  private adapterExited = false;
-  private closePromise: Promise<void> | undefined;
+  private readonly threadsById = new Map<number, ThreadRecord>();
+  private readonly changeWaiters = new Set<() => void>();
+  private readonly outputEvents: DebugProtocol.OutputEvent["body"][] = [];
+  private readonly pendingBreakpointFiles = new Set<string>();
 
-  // Negotiated protocol state
+  private state: SessionState = { state: "starting" };
   private capabilities: DebugProtocol.Capabilities = {};
-
-  // Thread execution state
-  private readonly threadsById = new Map<number, Thread>();
   private revision = 0;
   private lastStoppedThreadId: number | undefined;
-  private lastStop: { revision: number; threadId?: number; details: Stop } | undefined;
-  private allThreadsStoppedRevision: number | undefined;
+  private lastStop: StopEventRecord | undefined;
+  private pendingAllStop: StopEventRecord | undefined;
+  private debuggeeExit: { exitCode: number } | undefined;
 
-  // Debuggee output state
-  private readonly outputBuffer: DebugProtocol.OutputEvent["body"][] = [];
-
-  // Startup handshake state
   private initializedSeen = false;
-  private configureOnInitialized: (() => void) | undefined;
-
-  // Concurrency coordination
-  private readonly changeListeners = new Set<() => void>();
-  private mutationTail: Promise<void> = Promise.resolve();
+  private initializedCompleted = false;
+  private launchDispatched = false;
+  private transportFailed = false;
+  private transportStart: Promise<void> | undefined;
+  private startCalled = false;
+  private cleanupPromise: Promise<void> | undefined;
+  private busy = false;
+  private pendingExecution = false;
 
   constructor(
     private readonly adapter: DebugAdapter,
     private readonly configuration: DebugConfiguration,
     private readonly cwd: string,
   ) {
-    adapter.onEvent((event) => this.handleEvent(event));
+    this.client = new DapClient(adapter);
+    adapter.onEvent((event) => {
+      try {
+        this.handleEvent(event);
+      } catch (error) {
+        void this.close({ kind: "error", message: errorMessage(error) });
+      }
+    });
     adapter.onRequest((request) => this.handleReverseRequest(request));
-    adapter.onError((error) => this.handleAdapterError(error));
-    adapter.onExit((code) => this.handleAdapterExit(code));
+    adapter.onError((error) => this.handleTransportFailure(error));
+    adapter.onExit((code) => this.handleTransportFailure(new Error(`Debug adapter exited with code ${code}.`)));
   }
 
-  // State queries
   get isClosed(): boolean {
     return this.state.state === "closed";
   }
 
+  /** Return only state already observed locally; this never asks the adapter for threads. */
   snapshot(): SessionSnapshot {
-    const threads = [...this.threadsById.values()]
-      .filter((thread) => thread.state !== "exited")
-      .sort((a, b) => a.id - b.id)
-      .map((thread) => ({
-        id: thread.id,
-        ...(thread.name ? { name: thread.name } : {}),
-        state: thread.state,
-        ...(thread.stop ? { stop: thread.stop } : {}),
-      }));
-
     return {
-      state: structuredClone(this.state),
       configuration: {
         name: this.configuration.name,
         type: this.configuration.type,
@@ -118,37 +113,54 @@ export class DebugSession {
       capabilities: {
         supportsSingleThreadExecutionRequests: this.capabilities.supportsSingleThreadExecutionRequests === true,
       },
-      threads,
+      state: structuredClone(this.state),
+      revision: this.revision,
+      threads: [...this.threadsById.values()]
+        .filter((thread) => thread.state !== "exited")
+        .sort((a, b) => a.id - b.id)
+        .map((thread) => this.threadSnapshot(thread)),
       ...(this.debuggeeExit ? { debuggeeExit: { ...this.debuggeeExit } } : {}),
     };
   }
 
-  // Lifecycle commands
-
-  /** Start the transport and complete the DAP configuration handshake. */
-  async start(options: SessionStartOptions, signal?: AbortSignal): Promise<StartResult> {
-    if (this.state.state !== "starting" || this.transportStart) {
-      throw new Error(`Cannot start a debug session in state '${this.state.state}'.`);
+  /** Complete the startup handshake, then observe an initial stop for waitMs. */
+  async start(
+    options: StartOptions,
+    signal?: AbortSignal,
+  ): Promise<{ execution: ExecutionOutcome; breakpoints: BreakpointsResult[] }> {
+    if (this.startCalled || this.state.state !== "starting") {
+      throw new DebugError("INVALID_STATE", "Debug session startup has already begun.");
     }
-    const baseline = this.revision;
-    const startupSignal = signal ? AbortSignal.any([signal, this.lifetime.signal]) : this.lifetime.signal;
-    const onAbort = (): void => {
-      void this.close();
-    };
-    signal?.addEventListener("abort", onAbort, { once: true });
+    this.startCalled = true;
 
+    const deadline = new AbortController();
+    const remaining = options.deadline - Date.now();
+    const timeoutError = new DebugError("REQUEST_TIMEOUT", "Debug session startup timed out.", {
+      timeoutMs: 30_000,
+    });
+    const timer = setTimeout(() => deadline.abort(timeoutError), Math.max(0, remaining));
+    const startupSignal = signal
+      ? AbortSignal.any([signal, this.lifetime.signal, deadline.signal])
+      : AbortSignal.any([this.lifetime.signal, deadline.signal]);
+
+    let breakpoints: BreakpointsResult[];
+    let baseline: number;
     try {
-      if (signal?.aborted) onAbort();
-      startupSignal.throwIfAborted();
-      // Register the resource acquisition before invoking adapter code, which may close us synchronously.
-      this.transportStart = Promise.resolve().then(async () => {
-        startupSignal.throwIfAborted();
-        await this.adapter.startSession(startupSignal);
-      });
-      await this.transportStart;
-      startupSignal.throwIfAborted();
+      this.assertWaitMs(options.waitMs);
+      throwIfAborted(startupSignal);
+      this.transportStart = Promise.resolve().then(() => this.adapter.startSession(startupSignal));
+      await observe(
+        this.transportStart.catch((error: unknown) => {
+          if (startupSignal.aborted) throw abortError(startupSignal);
+          throw new DebugError("CONNECTION_ERROR", `Unable to start debug adapter: ${errorMessage(error)}`, undefined, {
+            cause: error,
+          });
+        }),
+        startupSignal,
+      );
+      this.assertStarting();
 
-      const initialize = await this.request(
+      const initialize = await this.call(
         "initialize",
         {
           clientID: "pi-debug",
@@ -165,991 +177,849 @@ export class DebugSession {
           supportsMemoryEvent: false,
           supportsStartDebuggingRequest: false,
         },
-        START_TIMEOUT_MS,
-        signal,
+        this.startupRequestTimeout(options.deadline),
+        startupSignal,
       );
-      startupSignal.throwIfAborted();
-      this.mergeCapabilities(initialize.body);
-      this.initializeCompleted = true;
+      this.assertStarting();
+      this.capabilities = { ...this.capabilities, ...initialize.body };
+      this.initializedCompleted = true;
 
-      const configurationDone = new Promise<BreakpointSet[]>((resolve, reject) => {
-        this.configureOnInitialized = () => {
-          this.configureOnInitialized = undefined;
-          void this.configure(options.breakpoints, startupSignal).then(resolve, reject);
-        };
-      });
-      const configured = withTimeout(configurationDone, START_TIMEOUT_MS, "debug configuration", startupSignal);
-      // initialized may arrive before the initialize continuation installs the configuration callback.
-      if (this.initializedSeen) this.configureOnInitialized?.();
-
-      const launchOrAttach = this.request(this.configuration.request, this.configuration, START_TIMEOUT_MS, signal);
-      const [, breakpoints] = await Promise.all([launchOrAttach, configured]);
-
-      startupSignal.throwIfAborted();
+      baseline = this.revision;
+      this.launchDispatched = true;
+      const launched = this.call(
+        this.configuration.request,
+        this.configuration,
+        this.startupRequestTimeout(options.deadline),
+        startupSignal,
+      );
+      // A launch response may wait for configurationDone, so both paths must progress together.
+      const [launchResponse, configured] = await Promise.all([
+        launched,
+        this.configure(options.breakpoints, options.deadline, startupSignal),
+      ]);
+      this.assertStarting();
+      this.capabilities = { ...this.capabilities, ...launchResponse.body };
+      breakpoints = configured;
       this.state = { state: "active" };
-      const waited = await this.waitAfter(baseline, { waitMs: options.waitMs }, signal);
-      return {
-        execution: waited,
-        breakpoints,
-      };
+      this.notifyChange();
     } catch (error) {
-      await this.beginClose({ kind: "error", message: errorMessage(error) });
+      const reason: SessionEndReason =
+        error instanceof DebugError && error.code === "CANCELLED"
+          ? { kind: "requested" }
+          : { kind: "error", message: errorMessage(error) };
+      const cleanup = this.close(reason);
+      await finishesWithin(cleanup, START_CLEANUP_WAIT_MS);
+      const finalState = this.snapshot().state;
+      const cleanupError = finalState.state === "closed" ? finalState.cleanupError : undefined;
+      if (cleanupError && error instanceof DebugError) {
+        throw new DebugError(error.code, error.message, { ...error.details, cleanupError }, { cause: error });
+      }
       throw error;
     } finally {
-      this.configureOnInitialized = undefined;
-      signal?.removeEventListener("abort", onAbort);
+      clearTimeout(timer);
     }
+
+    return {
+      breakpoints,
+      execution: await this.waitAfter(baseline, { waitMs: options.waitMs }, signal),
+    };
   }
 
-  /** Request closure and await cleanup. Failures are reported in the final status, not thrown. */
-  close(): Promise<void> {
-    return this.beginClose({ kind: "requested" });
+  /** Begin one cleanup task; its final error, if any, is retained in the closed snapshot. */
+  close(reason: SessionEndReason = { kind: "requested" }): Promise<void> {
+    if (this.cleanupPromise) return this.cleanupPromise;
+    this.cleanupPromise = Promise.resolve().then(() => this.closeOnce(reason));
+    this.state = { state: "closing", reason };
+    this.lifetime.abort(
+      reason.kind === "error"
+        ? new DebugError("CONNECTION_ERROR", reason.message)
+        : new DebugError("INVALID_STATE", "Debug session is closing."),
+    );
+    this.client.failPending(abortError(this.lifetime.signal));
+    this.notifyChange();
+    return this.cleanupPromise;
   }
-
-  // Breakpoint commands
 
   /** Replace all source breakpoints in one file. */
-  async setBreakpoints(file: string, lines: readonly number[], signal?: AbortSignal): Promise<SetBreakpointsResult> {
-    this.assertActive();
-    return this.withMutation(async () => {
+  async setBreakpoints(source: SourceBreakpoints, signal?: AbortSignal): Promise<BreakpointsResult> {
+    return this.withOperation(async () => {
       this.assertActive();
-      const breakpoints = await this.sendBreakpoints(file, lines, signal);
-      return { breakpoints: { source: { path: resolve(this.cwd, file) }, breakpoints: breakpoints } };
-    });
-  }
-
-  // Execution commands
-
-  /** Continue a stopped thread or all threads. */
-  async continue(options: ResumeOptions, signal?: AbortSignal): Promise<ExecutionOutcome> {
-    return this.resume("continue", options, signal);
-  }
-
-  /** Step over in a stopped thread. */
-  async next(options: ResumeOptions, signal?: AbortSignal): Promise<ExecutionOutcome> {
-    return this.resume("next", options, signal);
-  }
-
-  /** Step into in a stopped thread. */
-  async stepIn(options: ResumeOptions, signal?: AbortSignal): Promise<ExecutionOutcome> {
-    return this.resume("stepIn", options, signal);
-  }
-
-  /** Step out in a stopped thread. */
-  async stepOut(options: ResumeOptions, signal?: AbortSignal): Promise<ExecutionOutcome> {
-    return this.resume("stepOut", options, signal);
-  }
-
-  /** Pause a running thread and optionally wait for the resulting stop. */
-  async pause(options: PauseOptions, signal?: AbortSignal): Promise<ExecutionOutcome> {
-    this.assertActive();
-    let baseline = this.revision;
-    let threadId = 0;
-
-    await this.withMutation(async () => {
-      this.assertActive();
-      threadId = await this.selectRunningThread(options.threadId, signal);
-      baseline = this.revision;
-      await this.request("pause", { threadId }, REQUEST_TIMEOUT_MS, signal);
-    }).catch((error: unknown) => {
-      signal?.throwIfAborted();
-      if (!this.lifetime.signal.aborted || error !== this.lifetime.signal.reason) throw error;
-    });
-
-    return this.waitAfter(baseline, { threadId, waitMs: options.waitMs }, signal);
-  }
-
-  /** Wait for a new stop, thread exit or completed closure; an already closed session returns immediately. */
-  async wait(options: WaitOptions, signal?: AbortSignal): Promise<ExecutionOutcome> {
-    return this.waitAfter(this.revision, options, signal);
-  }
-
-  // Inspection commands
-
-  /** Refresh and return a page of active threads. */
-  async threads(options: PaginationOptions, signal?: AbortSignal): Promise<Page<ThreadSnapshot>> {
-    this.assertActive();
-    const all = await this.fetchThreads(signal);
-    const page = all.slice(options.start, options.start + options.count).map(toThreadSnapshot);
-    const nextStart = options.start + page.length < all.length ? options.start + page.length : undefined;
-    return {
-      start: options.start,
-      items: page,
-      ...(nextStart !== undefined ? { nextStart } : {}),
-      total: all.length,
-    };
-  }
-
-  /** Return a page of stack frames for a stopped thread. */
-  async stackTrace(options: StackTraceOptions, signal?: AbortSignal): Promise<StackTrace> {
-    this.assertActive();
-    const thread = await this.selectStoppedThread(options.threadId, signal);
-    const revision = thread.executionRevision;
-    const response = await this.request(
-      "stackTrace",
-      {
-        threadId: thread.id,
-        startFrame: options.start,
-        levels: options.count,
-      },
-      REQUEST_TIMEOUT_MS,
-      signal,
-    );
-    this.assertThreadRevision(thread.id, revision);
-    const frames = response.body.stackFrames.map((data, offset) => ({ index: options.start + offset, data }));
-    const total = response.body.totalFrames;
-    const nextStart =
-      frames.length === options.count && (total === undefined || options.start + frames.length < total)
-        ? options.start + frames.length
-        : undefined;
-    return {
-      threadId: thread.id,
-      stack: {
-        start: options.start,
-        items: frames,
-        ...(total !== undefined ? { total } : {}),
-        ...(nextStart !== undefined ? { nextStart } : {}),
-      },
-    };
-  }
-
-  /** Return one page of direct children from a scope or variable container. */
-  async variables(options: VariablesOptions, signal?: AbortSignal): Promise<Variables> {
-    this.assertActive();
-    const thread = await this.selectStoppedThread(options.threadId, signal);
-    const revision = thread.executionRevision;
-    let variablesReference: number;
-    let container: Variables["container"];
-
-    if (options.variablesReference !== undefined) {
-      if (options.variablesReference <= 0) throw new Error("variablesReference must be greater than zero.");
-      variablesReference = options.variablesReference;
-      container = { kind: "variable", variablesReference };
-    } else {
-      const frame = await this.resolveFrame(thread.id, options.frame, revision, signal);
-      const scope = await this.resolveScope(frame.id, options.scope, thread.id, revision, signal);
-      variablesReference = scope.variablesReference;
-      container = { kind: "scope", frameIndex: options.frame, scope };
-    }
-
-    const page = await this.readVariablesPage(
-      variablesReference,
-      options.start,
-      options.count,
-      thread.id,
-      revision,
-      signal,
-    );
-    this.assertThreadRevision(thread.id, revision);
-    return {
-      threadId: thread.id,
-      container,
-      variables: {
-        start: options.start,
-        items: page.variables,
-        ...(page.nextStart !== undefined ? { nextStart: page.nextStart } : {}),
-      },
-    };
-  }
-
-  /** Evaluate an expression in a stopped stack frame. */
-  async evaluate(options: EvaluateOptions, signal?: AbortSignal): Promise<Evaluation> {
-    this.assertActive();
-    const thread = await this.selectStoppedThread(options.threadId, signal);
-    const revision = thread.executionRevision;
-    const frame = await this.resolveFrame(thread.id, options.frame, revision, signal);
-    const response = await this.request(
-      "evaluate",
-      {
-        expression: options.expression,
-        frameId: frame.id,
-        context: "watch",
-      },
-      REQUEST_TIMEOUT_MS,
-      signal,
-    );
-    this.assertThreadRevision(thread.id, revision);
-    return { threadId: thread.id, frameIndex: options.frame, data: response.body };
-  }
-
-  /** Return a page of buffered debuggee output. */
-  output(options: OutputOptions): Page<Output> {
-    const all = options.category
-      ? this.outputBuffer.filter((entry) => entry.category === options.category)
-      : this.outputBuffer;
-    const output = all.slice(options.start, options.start + options.count);
-    const nextStart = options.start + output.length < all.length ? options.start + output.length : undefined;
-    return {
-      start: options.start,
-      items: output,
-      ...(nextStart !== undefined ? { nextStart } : {}),
-      total: all.length,
-    };
-  }
-
-  /** Return a fixed-budget overview of a stopped thread and one selected frame. */
-  async inspect(options: InspectOptions, signal?: AbortSignal): Promise<Inspection> {
-    this.assertActive();
-    const thread = await this.selectStoppedThread(options.threadId, signal);
-    const revision = thread.executionRevision;
-    const stackResponse = await this.request(
-      "stackTrace",
-      { threadId: thread.id, startFrame: 0, levels: 20 },
-      REQUEST_TIMEOUT_MS,
-      signal,
-    );
-    this.assertThreadRevision(thread.id, revision);
-
-    const frames = stackResponse.body.stackFrames.map((data, index) => ({ index, data }));
-    const selectedFrame = frames[options.frame] ?? {
-      index: options.frame,
-      data: await this.resolveFrame(thread.id, options.frame, revision, signal),
-    };
-    const scopesResponse = await this.request("scopes", { frameId: selectedFrame.data.id }, REQUEST_TIMEOUT_MS, signal);
-    this.assertThreadRevision(thread.id, revision);
-
-    const scopes = scopesResponse.body.scopes;
-    const selected = this.selectInspectScope(scopes, options.scope);
-    const page = selected
-      ? await this.readVariablesPage(selected.variablesReference, 0, 50, thread.id, revision, signal)
-      : undefined;
-    this.assertThreadRevision(thread.id, revision);
-
-    const total = stackResponse.body.totalFrames;
-    const stackNextStart =
-      (total !== undefined && frames.length < total) || (total === undefined && frames.length === 20)
-        ? frames.length
-        : undefined;
-    const sourcePath = selectedFrame.data.source?.path;
-    const sourceContext = sourcePath ? await this.readSourceContext(sourcePath, selectedFrame.data.line) : undefined;
-    this.assertThreadRevision(thread.id, revision);
-    return {
-      thread: toThreadSnapshot(thread),
-      stack: {
-        start: 0,
-        items: frames,
-        ...(total !== undefined ? { total } : {}),
-        ...(stackNextStart !== undefined ? { nextStart: stackNextStart } : {}),
-      },
-      selection: {
-        frame: selectedFrame,
-        scopes: scopes,
-        ...(selected && page
-          ? {
-              variables: {
-                threadId: thread.id,
-                container: { kind: "scope", frameIndex: options.frame, scope: selected },
-                variables: {
-                  start: 0,
-                  items: page.variables,
-                  ...(page.nextStart !== undefined ? { nextStart: page.nextStart } : {}),
-                },
-              },
-            }
-          : {}),
-        ...(sourceContext ? { sourceContext } : {}),
-      },
-    };
-  }
-
-  // Lifecycle and configuration
-
-  private beginClose(reason: SessionEndReason): Promise<void> {
-    if (this.closePromise) return this.closePromise;
-    // Publish the promise before abort/notifications can reenter close().
-    this.closePromise = Promise.resolve().then(() => this.closeOnce(reason));
-    this.state = { state: "closing", reason };
-    this.lifetime.abort(new Error("Debug session is closing."));
-    this.notifyChange();
-    return this.closePromise;
-  }
-
-  private async closeOnce(reason: SessionEndReason): Promise<void> {
-    const errors: string[] = [];
-    // Await only resource acquisition: start() itself waits for this cleanup on failure.
-    await this.transportStart?.catch(() => undefined);
-
-    // DAP forbids further requests before the initialize response, even during startup cancellation.
-    if (this.initializeCompleted && !this.adapterExited) {
-      const args: DebugProtocol.DisconnectArguments = {};
-      if (this.capabilities.supportTerminateDebuggee) {
-        args.terminateDebuggee = reason.kind !== "terminated" && this.configuration.request === "launch";
-      }
-      try {
-        await this.sendRequest("disconnect", args, reason.kind === "error" ? 200 : DISCONNECT_TIMEOUT_MS);
-      } catch {
-        // Local resource cleanup remains authoritative if graceful disconnect fails.
-      }
-    }
-    try {
-      await this.adapter.stopSession();
-    } catch (error) {
-      errors.push(`stopSession: ${errorMessage(error)}`);
-    }
-    try {
-      this.adapter.dispose();
-    } catch (error) {
-      errors.push(`dispose: ${errorMessage(error)}`);
-    }
-    this.state = {
-      state: "closed",
-      reason,
-      ...(errors.length ? { cleanupError: errors.join("; ") } : {}),
-    };
-    this.notifyChange();
-  }
-
-  private async configure(breakpoints: readonly SourceBreakpoints[], signal: AbortSignal): Promise<BreakpointSet[]> {
-    signal.throwIfAborted();
-    const byFile = new Map<string, Set<number>>();
-    for (const source of breakpoints) {
       const path = resolve(this.cwd, source.file);
-      const lines = byFile.get(path) ?? new Set<number>();
-      source.lines.forEach((line) => lines.add(line));
-      byFile.set(path, lines);
-    }
-    const supportsConfigurationDone = this.capabilities.supportsConfigurationDoneRequest === true;
-    let configurationFailed = false;
-    try {
-      const sourceBreakpoints = Promise.all(
-        [...byFile].map(async ([file, lines]) => ({
-          source: { path: file },
-          breakpoints: await this.sendBreakpoints(file, [...lines], signal),
-        })),
+      if (this.pendingBreakpointFiles.has(path)) {
+        throw new DebugError("OPERATION_CONFLICT", `A breakpoint update for '${path}' is still pending.`);
+      }
+      const request = this.client.request(
+        "setBreakpoints",
+        { source: { path }, breakpoints: source.lines.map((line) => ({ line })) },
+        { timeoutMs: REQUEST_TIMEOUT_MS },
       );
-      if (supportsConfigurationDone) {
-        const [results] = await Promise.all([
-          sourceBreakpoints,
-          this.capabilities.exceptionBreakpointFilters?.length
-            ? this.request("setExceptionBreakpoints", { filters: [] }, START_TIMEOUT_MS, signal)
-            : undefined,
-        ]);
-        return results;
-      }
-      const results = await sourceBreakpoints;
-      // Legacy adapters use the last exception-breakpoint request as the configuration barrier.
-      await this.request("setExceptionBreakpoints", { filters: [] }, START_TIMEOUT_MS, signal);
-      return results;
-    } catch (error) {
-      configurationFailed = true;
-      throw error;
-    } finally {
-      // Complete the handshake even if a breakpoint request failed, unless closure/cancellation has begun.
-      if (supportsConfigurationDone && !signal.aborted) {
-        try {
-          await this.request("configurationDone", undefined, START_TIMEOUT_MS, signal);
-        } catch (error) {
-          // A secondary handshake failure must not replace the original configuration error.
-          if (!configurationFailed) throw error;
-        }
-      }
-    }
-  }
-
-  // Breakpoints
-
-  private async sendBreakpoints(
-    file: string,
-    lines: readonly number[],
-    signal?: AbortSignal,
-  ): Promise<DebugProtocol.Breakpoint[]> {
-    const path = resolve(this.cwd, file);
-    const requested = [...new Set(lines)].sort((a, b) => a - b);
-    const response = await this.request(
-      "setBreakpoints",
-      {
-        source: { path },
-        breakpoints: requested.map((line) => ({ line })),
-      },
-      REQUEST_TIMEOUT_MS,
-      signal,
-    );
-    return response.body.breakpoints;
-  }
-
-  // Execution and waiting
-
-  private async resume(
-    command: "continue" | "next" | "stepIn" | "stepOut",
-    options: ResumeOptions,
-    signal?: AbortSignal,
-  ): Promise<ExecutionOutcome> {
-    this.assertActive();
-    let baseline = this.revision;
-    let threadId = 0;
-
-    await this.withMutation(async () => {
+      this.pendingBreakpointFiles.add(path);
+      const settled = request.then(
+        (response) => {
+          this.pendingBreakpointFiles.delete(path);
+          return response;
+        },
+        (error: unknown) => {
+          this.pendingBreakpointFiles.delete(path);
+          throw error;
+        },
+      );
+      void settled.catch(() => undefined);
+      const response = await observe(settled, this.operationSignal(signal));
       this.assertActive();
-      if (options.singleThread && !this.capabilities.supportsSingleThreadExecutionRequests) {
-        throw new Error("The debug adapter does not support single-thread execution requests.");
+      return { source: { path }, body: response.body };
+    }, signal);
+  }
+
+  /** Execute one control request and observe a currently valid stop, exit, or closure. */
+  async execute(action: ExecuteAction, options: ExecuteOptions, signal?: AbortSignal): Promise<ExecutionOutcome> {
+    return this.withOperation(async () => {
+      this.assertActive();
+      this.assertWaitMs(options.waitMs);
+      if (action !== "pause" && options.singleThread && !this.capabilities.supportsSingleThreadExecutionRequests) {
+        throw new DebugError("INVALID_ARGUMENT", "This adapter does not support single-thread execution requests.");
       }
-      const thread = await this.selectStoppedThread(options.threadId, signal);
-      threadId = thread.id;
-      baseline = this.revision;
-      const threadRevision = thread.executionRevision;
-      const response = await this.request(
-        command,
-        { threadId, singleThread: options.singleThread },
+      if (action === "pause" && options.singleThread !== undefined) {
+        throw new DebugError("INVALID_ARGUMENT", "`pause` does not accept singleThread.");
+      }
+
+      const targetId =
+        action === "pause"
+          ? this.selectPausableThread(options.threadId).id
+          : this.selectStoppedThread(options).threadId;
+      const baseline = this.revision;
+      const command = action === "step_in" ? "stepIn" : action === "step_out" ? "stepOut" : action;
+      const before = new Map([...this.threadsById].map(([id, thread]) => [id, thread.lastChangedRevision]));
+      const args =
+        action === "pause" ? { threadId: targetId } : { threadId: targetId, singleThread: options.singleThread };
+
+      this.pendingExecution = true;
+      const request = this.client.request(command, args, { timeoutMs: REQUEST_TIMEOUT_MS });
+      const settled = request.then(
+        (response) => {
+          if (this.state.state === "active" && action !== "pause") {
+            const all =
+              action === "continue"
+                ? (response as DebugProtocol.ContinueResponse).body?.allThreadsContinued !== false
+                : options.singleThread !== true;
+            this.applySuccessfulResume(targetId, all, before);
+          }
+          this.pendingExecution = false;
+          return response;
+        },
+        (error: unknown) => {
+          this.pendingExecution = false;
+          throw error;
+        },
+      );
+      void settled.catch(() => undefined);
+      await observe(settled, this.operationSignal(signal));
+      return this.waitAfter(
+        baseline,
+        { threadId: action === "pause" ? targetId : undefined, waitMs: options.waitMs },
+        signal,
+        targetId,
+      );
+    }, signal);
+  }
+
+  /** Observe without sending a DAP request. */
+  async wait(options: WaitOptions, signal?: AbortSignal): Promise<ExecutionOutcome> {
+    if (this.state.state === "closed") return { kind: "closed", status: this.snapshot() };
+    return this.withOperation(
+      async () => {
+        if (this.state.state === "starting") throw new DebugError("INVALID_STATE", "Debug session is still starting.");
+        this.assertWaitMs(options.waitMs);
+        if (options.threadId !== undefined && !this.threadsById.has(options.threadId)) {
+          throw new DebugError("THREAD_NOT_FOUND", `Unknown thread ${options.threadId}.`, {
+            threadId: options.threadId,
+          });
+        }
+        return this.waitAfter(options.revision ?? -1, options, signal);
+      },
+      signal,
+      true,
+    );
+  }
+
+  /** Refresh active thread IDs and names, then return the requested page. */
+  async threads(page: PageOptions, signal?: AbortSignal): Promise<Page<ThreadSnapshot>> {
+    return this.withOperation(async () => {
+      this.assertActive();
+      this.assertPage(page);
+      const before = new Map([...this.threadsById].map(([id, thread]) => [id, thread.lastChangedRevision]));
+      const response = await this.call("threads", undefined, REQUEST_TIMEOUT_MS, signal);
+      this.assertActive();
+      if (!Array.isArray(response.body?.threads)) {
+        throw new DebugError("CONNECTION_ERROR", "Malformed threads response.");
+      }
+      this.applyThreadsResponse(response.body.threads, before);
+      const active = [...this.threadsById.values()]
+        .filter((thread) => thread.state !== "exited")
+        .sort((a, b) => a.id - b.id);
+      return this.page(
+        active.map((thread) => this.threadSnapshot(thread)),
+        page,
+      );
+    }, signal);
+  }
+
+  /** Return complete DAP frames for one stack page. */
+  async stackTrace(selection: ThreadSelection, page: PageOptions, signal?: AbortSignal): Promise<StackResult> {
+    return this.withOperation(async () => {
+      this.assertPage(page);
+      const stop = this.selectStoppedThread(selection);
+      const paged = this.capabilities.supportsDelayedStackTraceLoading === true;
+      const response = await this.call(
+        "stackTrace",
+        paged ? { threadId: stop.threadId, startFrame: page.start, levels: page.count } : { threadId: stop.threadId },
         REQUEST_TIMEOUT_MS,
         signal,
       );
-
-      this.assertActive();
-      const currentThread = this.threadsById.get(threadId);
-      if (currentThread?.state === "stopped" && currentThread.executionRevision === threadRevision) {
-        const responseAllThreads = (response.body as { allThreadsContinued?: boolean } | undefined)
-          ?.allThreadsContinued;
-        this.markContinued(threadId, responseAllThreads ?? !options.singleThread);
+      this.assertStop(stop);
+      if (!Array.isArray(response.body?.stackFrames)) {
+        throw new DebugError("CONNECTION_ERROR", "Malformed stackTrace response.");
       }
-    }).catch((error: unknown) => {
-      signal?.throwIfAborted();
-      if (!this.lifetime.signal.aborted || error !== this.lifetime.signal.reason) throw error;
-    });
-
-    return this.waitAfter(baseline, { threadId, waitMs: options.waitMs }, signal);
+      const frames = paged
+        ? response.body.stackFrames.slice(0, page.count)
+        : response.body.stackFrames.slice(page.start, page.start + page.count);
+      const total = response.body.totalFrames ?? (paged ? undefined : response.body.stackFrames.length);
+      return {
+        ...stop,
+        body: { ...response.body, stackFrames: frames },
+        page: this.pageInfo(page, frames.length, total),
+      };
+    }, signal);
   }
 
-  private async waitAfter(baseline: number, options: WaitOptions, signal?: AbortSignal): Promise<ExecutionOutcome> {
-    const deadline = Date.now() + options.waitMs;
-    while (true) {
-      signal?.throwIfAborted();
-      const outcome = this.findWaitOutcome(baseline, options.threadId);
-      if (outcome) {
-        const enriched = await this.enrichExecutionResult(outcome, signal);
-        if (outcome.kind !== "stopped" || !this.lifetime.signal.aborted) return enriched;
-        continue;
+  /** Read one scope or variable container while its stop revision remains valid. */
+  async variables(selection: VariablesSelection, page: PageOptions, signal?: AbortSignal): Promise<VariablesResult> {
+    return this.withOperation(async () => {
+      this.assertPage(page);
+      const stop = this.selectStoppedThread(selection);
+      let reference: number;
+      if ("variablesReference" in selection && selection.variablesReference !== undefined) {
+        if (selection.revision === undefined || selection.variablesReference <= 0) {
+          throw new DebugError("INVALID_ARGUMENT", "Expanding a variable requires a positive reference and revision.");
+        }
+        reference = selection.variablesReference;
+      } else {
+        const frame = await this.resolveFrame(stop, selection.frameIndex, signal);
+        const scopes = await this.call("scopes", { frameId: frame.id }, REQUEST_TIMEOUT_MS, signal);
+        this.assertStop(stop);
+        if (!Array.isArray(scopes.body?.scopes)) {
+          throw new DebugError("CONNECTION_ERROR", "Malformed scopes response.");
+        }
+        const matches = scopes.body.scopes.filter(
+          (scope) => scope.name.toLowerCase() === selection.scope.toLowerCase(),
+        );
+        if (matches.length !== 1) {
+          throw new DebugError("INVALID_ARGUMENT", `Scope '${selection.scope}' is missing or ambiguous.`, {
+            availableScopes: scopes.body.scopes.map((scope) => scope.name),
+          });
+        }
+        reference = matches[0].variablesReference;
       }
-      if (options.waitMs === 0 || Date.now() >= deadline) return { kind: "timeout", status: this.snapshot() };
-      await this.waitForChange(deadline - Date.now(), signal);
+
+      if (reference === 0) {
+        return { ...stop, body: { variables: [] }, page: this.pageInfo(page, 0, 0) };
+      }
+      const response = await this.call(
+        "variables",
+        { variablesReference: reference, start: page.start, count: page.count },
+        REQUEST_TIMEOUT_MS,
+        signal,
+      );
+      this.assertStop(stop);
+      if (!Array.isArray(response.body?.variables)) {
+        throw new DebugError("CONNECTION_ERROR", "Malformed variables response.");
+      }
+      const variables = response.body.variables.slice(0, page.count);
+      return {
+        ...stop,
+        body: { ...response.body, variables },
+        page: this.pageInfo(page, variables.length),
+      };
+    }, signal);
+  }
+
+  /** Evaluate in a selected stopped frame; expressions may have target-side effects. */
+  async evaluate(
+    selection: FrameSelection,
+    expression: string,
+    signal?: AbortSignal,
+  ): Promise<Inspection<DebugProtocol.EvaluateResponse["body"]>> {
+    return this.withOperation(async () => {
+      if (!expression.trim()) throw new DebugError("INVALID_ARGUMENT", "Expression must not be empty.");
+      const stop = this.selectStoppedThread(selection);
+      const frame = await this.resolveFrame(stop, selection.frameIndex, signal);
+      const response = await this.call(
+        "evaluate",
+        { expression, frameId: frame.id, context: "watch" },
+        REQUEST_TIMEOUT_MS,
+        signal,
+      );
+      this.assertStop(stop);
+      return { ...stop, body: response.body };
+    }, signal);
+  }
+
+  /** Return an event page after exact category filtering. */
+  output(options: OutputOptions): Page<DebugProtocol.OutputEvent["body"]> {
+    this.assertPage(options);
+    const events = options.category
+      ? this.outputEvents.filter((event) => event.category === options.category)
+      : this.outputEvents;
+    const result = this.page(events, options);
+    return { ...result, items: result.items.map((event) => structuredClone(event)) };
+  }
+
+  private async configure(
+    breakpoints: SourceBreakpoints[],
+    deadlineAt: number,
+    signal: AbortSignal,
+  ): Promise<BreakpointsResult[]> {
+    while (!this.initializedSeen) {
+      this.assertStarting();
+      throwIfAborted(signal);
+      await this.waitForChange(this.startupRemaining(deadlineAt), signal);
+    }
+
+    const seen = new Set<string>();
+    const results: BreakpointsResult[] = [];
+    for (const source of breakpoints) {
+      const path = resolve(this.cwd, source.file);
+      if (seen.has(path)) {
+        throw new DebugError("INVALID_ARGUMENT", `Initial breakpoints repeat source '${path}'.`);
+      }
+      seen.add(path);
+      const response = await this.call(
+        "setBreakpoints",
+        { source: { path }, breakpoints: source.lines.map((line) => ({ line })) },
+        this.startupRequestTimeout(deadlineAt),
+        signal,
+      );
+      this.assertStarting();
+      results.push({ source: { path }, body: response.body });
+    }
+
+    const filters =
+      this.capabilities.exceptionBreakpointFilters?.filter((filter) => filter.default).map((filter) => filter.filter) ??
+      [];
+    if (this.capabilities.exceptionBreakpointFilters?.length) {
+      await this.call("setExceptionBreakpoints", { filters }, this.startupRequestTimeout(deadlineAt), signal);
+      this.assertStarting();
+    }
+    if (this.capabilities.supportsConfigurationDoneRequest) {
+      await this.call("configurationDone", undefined, this.startupRequestTimeout(deadlineAt), signal);
+      this.assertStarting();
+    }
+    return results;
+  }
+
+  private startupRemaining(deadlineAt: number): number {
+    const remaining = deadlineAt - Date.now();
+    if (remaining <= 0) throw new DebugError("REQUEST_TIMEOUT", "Debug session startup timed out.");
+    return remaining;
+  }
+
+  private startupRequestTimeout(deadlineAt: number): number {
+    return Math.min(REQUEST_TIMEOUT_MS, this.startupRemaining(deadlineAt));
+  }
+
+  private assertStarting(): void {
+    if (this.state.state !== "starting") {
+      throw new DebugError("INVALID_STATE", `Debug session is ${this.state.state}.`, { state: this.state.state });
     }
   }
 
-  private findWaitOutcome(baseline: number, threadId?: number): ExecutionOutcome | undefined {
-    if (this.isClosed) return { kind: "closed", status: this.snapshot() };
-    if (this.state.state === "closing") return undefined;
-
+  private selectPausableThread(threadId?: number): ThreadRecord {
+    this.assertActive();
     if (threadId !== undefined) {
       const thread = this.threadsById.get(threadId);
-      if (thread && thread.lastRevision > baseline) {
-        if (thread.state === "stopped") return { kind: "stopped", thread: toThreadSnapshot(thread) };
-        if (thread.state === "exited") return { kind: "threadExited", threadId };
+      if (!thread) throw new DebugError("THREAD_NOT_FOUND", `Unknown thread ${threadId}.`);
+      if (thread.state === "running" || thread.state === "unknown") return thread;
+      throw new DebugError("INVALID_STATE", `Thread ${threadId} cannot be paused from state '${thread.state}'.`);
+    }
+    const pausable = [...this.threadsById.values()].filter(
+      (thread) => thread.state === "running" || thread.state === "unknown",
+    );
+    if (pausable.length !== 1) {
+      throw new DebugError("THREAD_SELECTION_REQUIRED", "Specify one pausable thread.", {
+        pausableThreadIds: pausable.map((thread) => thread.id),
+      });
+    }
+    return pausable[0];
+  }
+
+  private selectStoppedThread(selection: ThreadSelection): StopContext {
+    this.assertActive();
+    let thread: ThreadRecord | undefined;
+    if (selection.threadId !== undefined) {
+      thread = this.threadsById.get(selection.threadId);
+      if (!thread) throw new DebugError("THREAD_NOT_FOUND", `Unknown thread ${selection.threadId}.`);
+    } else {
+      thread = this.lastStoppedThreadId === undefined ? undefined : this.threadsById.get(this.lastStoppedThreadId);
+      if (thread?.state !== "stopped") {
+        const stopped = [...this.threadsById.values()].filter((entry) => entry.state === "stopped");
+        if (stopped.length !== 1) {
+          throw new DebugError("THREAD_SELECTION_REQUIRED", "Specify one stopped thread.", {
+            stoppedThreadIds: stopped.map((entry) => entry.id),
+          });
+        }
+        thread = stopped[0];
+      }
+    }
+    if (thread.state !== "stopped" || thread.stopRevision === undefined) {
+      throw new DebugError("INVALID_STATE", `Thread ${thread.id} is not stopped.`, { threadId: thread.id });
+    }
+    if (selection.revision !== undefined && selection.revision !== thread.stopRevision) {
+      throw new DebugError("STALE_REVISION", `Thread ${thread.id} no longer has stop revision ${selection.revision}.`, {
+        threadId: thread.id,
+        revision: selection.revision,
+        currentRevision: thread.stopRevision,
+      });
+    }
+    return { threadId: thread.id, revision: thread.stopRevision };
+  }
+
+  private applySuccessfulResume(threadId: number, all: boolean, before: ReadonlyMap<number, number>): void {
+    const candidates = all ? [...this.threadsById.values()] : [this.threadsById.get(threadId)];
+    const unchanged = candidates.filter(
+      (thread): thread is ThreadRecord =>
+        thread !== undefined && thread.state !== "exited" && before.get(thread.id) === thread.lastChangedRevision,
+    );
+    if (!unchanged.length) return;
+    const revision = ++this.revision;
+    for (const thread of unchanged) this.setRunning(thread, revision);
+    this.pendingAllStop = undefined;
+    this.lastStop = undefined;
+    this.notifyChange();
+  }
+
+  private async waitAfter(
+    baseline: number,
+    options: { threadId?: number; waitMs: number },
+    signal?: AbortSignal,
+    selectedThreadId?: number,
+  ): Promise<ExecutionOutcome> {
+    const deadline = Date.now() + options.waitMs;
+    while (true) {
+      throwIfAborted(signal);
+      const outcome = this.findOutcome(baseline, options.threadId, selectedThreadId);
+      if (outcome) return outcome;
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) return { kind: "timeout", status: this.snapshot() };
+      await this.waitForChange(remaining, signal);
+    }
+  }
+
+  private findOutcome(baseline: number, threadId?: number, selectedThreadId?: number): ExecutionOutcome | undefined {
+    if (this.state.state === "closed") return { kind: "closed", status: this.snapshot() };
+    if (this.state.state === "closing") return undefined;
+    if (threadId !== undefined) {
+      const thread = this.threadsById.get(threadId);
+      if (thread?.state === "exited") return { kind: "threadExited", threadId };
+      if (thread?.state === "stopped" && thread.stopRevision !== undefined && thread.stopRevision > baseline) {
+        return { kind: "stopped", thread: this.stoppedThread(thread) };
       }
       return undefined;
     }
-
-    if (this.lastStop && this.lastStop.revision > baseline) {
-      const thread = this.lastStop.threadId === undefined ? undefined : this.threadsById.get(this.lastStop.threadId);
-      if (thread) return { kind: "stopped", thread: toThreadSnapshot(thread) };
+    if (selectedThreadId !== undefined && this.threadsById.get(selectedThreadId)?.state === "exited") {
+      return { kind: "threadExited", threadId: selectedThreadId };
+    }
+    const stopped = [...this.threadsById.values()]
+      .filter(
+        (thread) => thread.state === "stopped" && thread.stopRevision !== undefined && thread.stopRevision > baseline,
+      )
+      .sort((a, b) => b.stopRevision! - a.stopRevision!);
+    if (stopped.length) return { kind: "stopped", thread: this.stoppedThread(stopped[0]) };
+    if (
+      this.lastStop?.revision !== undefined &&
+      this.lastStop.revision > baseline &&
+      this.lastStop.threadId === undefined
+    ) {
+      return { kind: "stopped", revision: this.lastStop.revision, stop: structuredClone(this.lastStop.body) };
     }
     return undefined;
   }
 
-  private async enrichExecutionResult(result: ExecutionOutcome, signal?: AbortSignal): Promise<ExecutionOutcome> {
-    if (result.kind !== "stopped" || !result.thread.stop) return result;
-
-    try {
-      const response = await this.request(
-        "stackTrace",
-        { threadId: result.thread.id, startFrame: 0, levels: 1 },
-        REQUEST_TIMEOUT_MS,
-        signal,
-      );
-      const data = response.body.stackFrames[0];
-      if (!data) return result;
-      return { ...result, thread: { ...result.thread, stop: { ...result.thread.stop, topFrame: { index: 0, data } } } };
-    } catch {
-      signal?.throwIfAborted();
-      return result;
-    }
-  }
-
   private waitForChange(timeoutMs: number, signal?: AbortSignal): Promise<void> {
-    return new Promise<void>((resolvePromise, rejectPromise) => {
-      if (signal?.aborted) {
-        rejectPromise(abortError(signal));
-        return;
-      }
-      let timer: ReturnType<typeof setTimeout> | undefined;
+    return new Promise((resolvePromise, rejectPromise) => {
+      if (signal?.aborted) return rejectPromise(abortError(signal));
+      let timer: ReturnType<typeof setTimeout>;
+      const cleanup = (): void => {
+        clearTimeout(timer);
+        this.changeWaiters.delete(done);
+        signal?.removeEventListener("abort", aborted);
+      };
       const done = (): void => {
         cleanup();
         resolvePromise();
       };
       const aborted = (): void => {
         cleanup();
-        rejectPromise(abortError(signal));
+        rejectPromise(abortError(signal!));
       };
-      const cleanup = (): void => {
-        if (timer) clearTimeout(timer);
-        this.changeListeners.delete(done);
-        signal?.removeEventListener("abort", aborted);
-      };
-      this.changeListeners.add(done);
+      this.changeWaiters.add(done);
       signal?.addEventListener("abort", aborted, { once: true });
-      timer = setTimeout(done, Math.max(0, timeoutMs));
+      timer = setTimeout(done, timeoutMs);
     });
   }
 
-  // Thread selection and inspection
+  private notifyChange(): void {
+    for (const notify of [...this.changeWaiters]) notify();
+  }
 
-  private async fetchThreads(signal?: AbortSignal): Promise<Thread[]> {
-    const response = await this.request("threads", undefined, REQUEST_TIMEOUT_MS, signal);
-    this.assertActive();
-    const activeIds = new Set(response.body.threads.map((thread) => thread.id));
-    let removedThread = false;
-    for (const thread of this.threadsById.values()) {
-      if (thread.state === "exited" || activeIds.has(thread.id)) continue;
-      const revision = ++this.revision;
+  private applyThreadsResponse(values: DebugProtocol.Thread[], before: ReadonlyMap<number, number>): void {
+    const activeIds = new Set(values.map((thread) => thread.id));
+    const disappeared = [...this.threadsById.values()].filter(
+      (thread) =>
+        thread.state !== "exited" && !activeIds.has(thread.id) && before.get(thread.id) === thread.lastChangedRevision,
+    );
+    const discovered = values.filter((value) => {
+      const existing = this.threadsById.get(value.id);
+      return !existing || (existing.state === "exited" && before.get(value.id) === existing.lastChangedRevision);
+    });
+    const revision = disappeared.length || discovered.length ? ++this.revision : this.revision;
+
+    for (const thread of disappeared) {
       thread.state = "exited";
-      thread.executionRevision++;
-      thread.lastRevision = revision;
       thread.stop = undefined;
-      removedThread = true;
+      thread.stopRevision = undefined;
+      thread.lastChangedRevision = revision;
     }
-    for (const value of response.body.threads) {
+    for (const value of values) {
       const existing = this.threadsById.get(value.id);
       if (existing) {
         existing.name = value.name;
-        if (
-          this.allThreadsStoppedRevision !== undefined &&
-          existing.lastRevision < this.allThreadsStoppedRevision &&
-          existing.state !== "exited"
-        ) {
-          existing.state = "stopped";
-          existing.stop = this.lastStop?.details;
+        if (existing.state === "exited" && before.get(value.id) === existing.lastChangedRevision) {
+          existing.state = "unknown";
+          existing.lastChangedRevision = revision;
         }
       } else {
-        const coveredByAllThreadsStop = this.allThreadsStoppedRevision !== undefined;
+        const stopped = this.pendingAllStop;
         this.threadsById.set(value.id, {
           id: value.id,
           name: value.name,
-          state: coveredByAllThreadsStop ? "stopped" : "unknown",
-          executionRevision: 0,
-          lastRevision: 0,
-          ...(coveredByAllThreadsStop ? { stop: this.lastStop?.details } : {}),
+          state: stopped ? "stopped" : "unknown",
+          lastChangedRevision: revision,
+          ...(stopped ? { stopRevision: stopped.revision, stop: stopped.body } : {}),
         });
       }
     }
-    if (removedThread) this.notifyChange();
-    return [...this.threadsById.values()]
-      .filter((thread) => thread.state !== "exited" && activeIds.has(thread.id))
-      .sort((a, b) => a.id - b.id);
-  }
-
-  private async selectStoppedThread(threadId: number | undefined, signal?: AbortSignal): Promise<Thread> {
-    let stopped = [...this.threadsById.values()].filter((thread) => thread.state === "stopped");
-    if (stopped.length === 0 || (threadId !== undefined && !this.threadsById.has(threadId))) {
-      await this.fetchThreads(signal);
-      stopped = [...this.threadsById.values()].filter((thread) => thread.state === "stopped");
-    }
-
-    if (threadId !== undefined) {
-      const thread = this.threadsById.get(threadId);
-      if (!thread) throw new Error(`Unknown thread ${threadId}.`);
-      if (thread.state !== "stopped") throw new Error(`Thread ${threadId} is not stopped.`);
-      return thread;
-    }
-
-    if (this.lastStoppedThreadId !== undefined) {
-      const recent = this.threadsById.get(this.lastStoppedThreadId);
-      if (recent?.state === "stopped") return recent;
-    }
-    if (stopped.length === 1) return stopped[0];
-    if (stopped.length === 0) throw new Error("No stopped thread is available.");
-    throw new Error("Multiple threads are stopped; provide threadId.");
-  }
-
-  private async selectRunningThread(threadId: number | undefined, signal?: AbortSignal): Promise<number> {
-    const threads = await this.fetchThreads(signal);
-    if (threadId !== undefined) {
-      const thread = this.threadsById.get(threadId);
-      if (!thread) throw new Error(`Unknown thread ${threadId}.`);
-      if (thread.state === "stopped") throw new Error(`Thread ${threadId} is already stopped.`);
-      return threadId;
-    }
-    const running = threads.filter((thread) => thread.state !== "stopped");
-    if (running.length === 1) return running[0].id;
-    if (running.length === 0) throw new Error("No running thread is available.");
-    throw new Error("Multiple threads can be paused; provide threadId.");
+    this.pendingAllStop = undefined;
+    if (disappeared.length || discovered.length) this.notifyChange();
   }
 
   private async resolveFrame(
-    threadId: number,
+    stop: StopContext,
     frameIndex: number,
-    revision: number,
     signal?: AbortSignal,
   ): Promise<DebugProtocol.StackFrame> {
-    const response = await this.request(
+    if (!Number.isInteger(frameIndex) || frameIndex < 0) {
+      throw new DebugError("INVALID_ARGUMENT", "frameIndex must be a non-negative integer.");
+    }
+    const paged = this.capabilities.supportsDelayedStackTraceLoading === true;
+    const response = await this.call(
       "stackTrace",
-      { threadId, startFrame: frameIndex, levels: 1 },
+      paged ? { threadId: stop.threadId, startFrame: frameIndex, levels: 1 } : { threadId: stop.threadId },
       REQUEST_TIMEOUT_MS,
       signal,
     );
-    this.assertThreadRevision(threadId, revision);
-    const frame = response.body.stackFrames[0];
-    if (!frame) throw new Error(`Stack frame ${frameIndex} does not exist on thread ${threadId}.`);
+    this.assertStop(stop);
+    const frames = response.body?.stackFrames;
+    if (!Array.isArray(frames)) throw new DebugError("CONNECTION_ERROR", "Malformed stackTrace response.");
+    const frame = paged ? frames[0] : frames[frameIndex];
+    if (!frame) {
+      throw new DebugError("INVALID_ARGUMENT", `Frame ${frameIndex} does not exist on thread ${stop.threadId}.`, {
+        threadId: stop.threadId,
+        frameIndex,
+      });
+    }
     return frame;
   }
 
-  private async resolveScope(
-    frameId: number,
-    requestedName: string,
-    threadId: number,
-    revision: number,
-    signal?: AbortSignal,
-  ): Promise<DebugProtocol.Scope> {
-    const response = await this.request("scopes", { frameId }, REQUEST_TIMEOUT_MS, signal);
-    this.assertThreadRevision(threadId, revision);
-    const requested = requestedName.toLocaleLowerCase();
-    const scope = response.body.scopes.find((candidate) => candidate.name.toLocaleLowerCase() === requested);
-    if (scope) return scope;
-    const available = response.body.scopes.map((candidate) => candidate.name).join(", ");
-    throw new Error(`Scope '${requestedName}' is not available. Available scopes: ${available || "none"}.`);
-  }
-
-  private selectInspectScope(
-    scopes: readonly DebugProtocol.Scope[],
-    requestedName: string | undefined,
-  ): DebugProtocol.Scope | undefined {
-    if (requestedName !== undefined) {
-      const requested = requestedName.toLocaleLowerCase();
-      const scope = scopes.find((candidate) => candidate.name.toLocaleLowerCase() === requested);
-      if (scope) return scope;
-      const available = scopes.map((candidate) => candidate.name).join(", ");
-      throw new Error(`Scope '${requestedName}' is not available. Available scopes: ${available || "none"}.`);
-    }
-    return (
-      scopes.find((scope) => scope.presentationHint === "locals") ??
-      scopes.find((scope) => scope.name.toLocaleLowerCase() === "locals") ??
-      scopes.find((scope) => !scope.expensive) ??
-      scopes[0]
-    );
-  }
-
-  private async readSourceContext(path: string, line: number): Promise<SourceContext | undefined> {
-    try {
-      const lines = (await readFile(path, "utf8")).split(/\r?\n/);
-      const startLine = Math.max(1, line - 2);
-      return {
-        path,
-        lines: lines
-          .slice(startLine - 1, Math.min(lines.length, line + 2))
-          .map((content, index) => ({ line: startLine + index, content })),
-      };
-    } catch {
-      return undefined;
-    }
-  }
-
-  private async readVariablesPage(
-    reference: number,
-    start: number,
-    count: number,
-    threadId: number,
-    revision: number,
-    signal?: AbortSignal,
-  ): Promise<{ variables: DebugProtocol.Variable[]; nextStart?: number }> {
-    if (reference <= 0) return { variables: [] };
-    const response = await this.request(
-      "variables",
-      { variablesReference: reference, start, count: count + 1 },
-      REQUEST_TIMEOUT_MS,
-      signal,
-    );
-    this.assertThreadRevision(threadId, revision);
-    const variables = response.body.variables.slice(0, count);
-    const nextStart = response.body.variables.length > count ? start + variables.length : undefined;
-    return { variables, ...(nextStart !== undefined ? { nextStart } : {}) };
-  }
-
-  private assertThreadRevision(threadId: number, revision: number): void {
+  private assertStop(stop: StopContext): void {
     this.assertActive();
-    const thread = this.threadsById.get(threadId);
-    if (!thread || thread.state !== "stopped" || thread.executionRevision !== revision) {
-      throw new Error(`Thread ${threadId} resumed or changed while it was being inspected; inspect it again.`);
+    const thread = this.threadsById.get(stop.threadId);
+    if (thread?.state !== "stopped" || thread.stopRevision !== stop.revision) {
+      throw new DebugError("STALE_REVISION", `Thread ${stop.threadId} changed while it was being inspected.`, {
+        threadId: stop.threadId,
+        revision: stop.revision,
+      });
     }
   }
-
-  // Adapter events and state transitions
 
   private handleEvent(event: DebugProtocol.Event): void {
-    if (this.isClosed) return;
-    if (this.state.state === "closing") {
-      if (event.event !== "output" && event.event !== "exited") return;
-    }
-
+    if (this.state.state === "closed") return;
+    if (this.state.state === "closing" && event.event !== "output" && event.event !== "exited") return;
     switch (event.event) {
       case "initialized":
         this.initializedSeen = true;
-        this.configureOnInitialized?.();
+        this.notifyChange();
         break;
       case "capabilities":
-        this.mergeCapabilities((event as DebugProtocol.CapabilitiesEvent).body.capabilities);
+        this.capabilities = {
+          ...this.capabilities,
+          ...(event as DebugProtocol.CapabilitiesEvent).body.capabilities,
+        };
         break;
       case "output":
-        this.outputBuffer.push((event as DebugProtocol.OutputEvent).body);
-        if (this.outputBuffer.length > OUTPUT_BUFFER_LIMIT) this.outputBuffer.shift();
+        this.outputEvents.push((event as DebugProtocol.OutputEvent).body);
+        if (this.outputEvents.length > 1000) this.outputEvents.shift();
         break;
       case "stopped":
-        this.handleStopped(event as DebugProtocol.StoppedEvent);
+        this.handleStopped((event as DebugProtocol.StoppedEvent).body);
         break;
       case "continued": {
-        const continued = event as DebugProtocol.ContinuedEvent;
-        this.markContinued(continued.body.threadId, continued.body.allThreadsContinued !== false);
-        break;
-      }
-      case "thread":
-        this.handleThread(event as DebugProtocol.ThreadEvent);
-        break;
-      case "invalidated":
-        this.invalidateThreads(event as DebugProtocol.InvalidatedEvent);
-        break;
-      case "exited": {
-        const exited = event as DebugProtocol.ExitedEvent;
-        this.debuggeeExit = { exitCode: exited.body.exitCode };
+        const body = (event as DebugProtocol.ContinuedEvent).body;
+        const revision = ++this.revision;
+        const affected =
+          body.allThreadsContinued === false
+            ? [this.getOrCreateThread(body.threadId)]
+            : [...this.threadsById.values(), this.getOrCreateThread(body.threadId)];
+        for (const thread of new Set(affected)) {
+          if (thread.state !== "exited") this.setRunning(thread, revision);
+        }
+        this.pendingAllStop = undefined;
+        this.lastStop = undefined;
         this.notifyChange();
         break;
       }
+      case "thread": {
+        const body = (event as DebugProtocol.ThreadEvent).body;
+        const thread = this.getOrCreateThread(body.threadId);
+        const revision = ++this.revision;
+        thread.state = body.reason === "exited" ? "exited" : "unknown";
+        thread.stop = undefined;
+        thread.stopRevision = undefined;
+        thread.lastChangedRevision = revision;
+        this.notifyChange();
+        break;
+      }
+      case "exited":
+        this.debuggeeExit = { exitCode: (event as DebugProtocol.ExitedEvent).body.exitCode };
+        this.notifyChange();
+        break;
+      case "invalidated":
+        this.handleInvalidated((event as DebugProtocol.InvalidatedEvent).body);
+        break;
       case "terminated":
-        void this.beginClose({ kind: "terminated" });
+        void this.close({ kind: "terminated" });
         break;
     }
   }
 
-  private handleStopped(event: DebugProtocol.StoppedEvent): void {
+  private handleInvalidated(body: DebugProtocol.InvalidatedEvent["body"]): void {
+    // Missing areas means everything the client cached may be stale.
+    const areas = new Set<DebugProtocol.InvalidatedAreas>(body.areas?.length ? body.areas : ["all"]);
+    const all = areas.has("all");
+    const invalidateStops = all || areas.has("stacks") || areas.has("variables");
+    const invalidateThreads = all || areas.has("threads");
+    if (!invalidateStops && !invalidateThreads) return;
+
+    const targets =
+      invalidateStops && body.threadId !== undefined
+        ? [this.threadsById.get(body.threadId)].filter((thread): thread is ThreadRecord => thread !== undefined)
+        : [...this.threadsById.values()];
+    if (!targets.length) return;
+
     const revision = ++this.revision;
-    const details: Stop = { event: { ...event.body } };
-    this.lastStop = { revision, threadId: event.body.threadId, details };
-    this.lastStoppedThreadId = event.body.threadId;
-    if (event.body.allThreadsStopped) this.allThreadsStoppedRevision = revision;
-
-    if (event.body.allThreadsStopped) {
-      for (const thread of this.threadsById.values()) this.updateStoppedThread(thread, revision, details);
-    }
-    if (event.body.threadId !== undefined) {
-      const thread = this.getOrCreateThread(event.body.threadId);
-      this.updateStoppedThread(thread, revision, details);
-    }
-    this.notifyChange();
-  }
-
-  private updateStoppedThread(thread: Thread, revision: number, details: Stop): void {
-    thread.state = "stopped";
-    thread.executionRevision++;
-    thread.lastRevision = revision;
-    thread.stop = details;
-  }
-
-  private markContinued(threadId: number, allThreads: boolean): void {
-    const revision = ++this.revision;
-    if (allThreads) this.allThreadsStoppedRevision = undefined;
-    const affected = allThreads ? [...this.threadsById.values()] : [this.getOrCreateThread(threadId)];
-    for (const thread of affected) {
+    for (const thread of targets) {
       if (thread.state === "exited") continue;
-      thread.state = "running";
-      thread.executionRevision++;
-      thread.lastRevision = revision;
-      thread.stop = undefined;
+      // Refresh stopRevision so cached stop contexts become STALE_REVISION.
+      if (invalidateStops && thread.state === "stopped") thread.stopRevision = revision;
+      thread.lastChangedRevision = revision;
     }
     this.notifyChange();
   }
 
-  private handleThread(event: DebugProtocol.ThreadEvent): void {
+  private handleStopped(body: DebugProtocol.StoppedEvent["body"]): void {
     const revision = ++this.revision;
-    const thread = this.getOrCreateThread(event.body.threadId);
-    thread.executionRevision++;
-    thread.lastRevision = revision;
-    if (event.body.reason === "exited") {
-      thread.state = "exited";
-      thread.stop = undefined;
-    } else if (event.body.reason === "started" && thread.state === "exited") {
-      thread.state = "unknown";
+    const stop: StopEventRecord = { revision, body, threadId: body.threadId };
+    this.lastStop = stop;
+    if (body.allThreadsStopped) {
+      this.pendingAllStop = stop;
+      for (const thread of this.threadsById.values()) {
+        if (thread.state === "exited") continue;
+        if (thread.state !== "stopped" || thread.id === body.threadId) this.setStopped(thread, revision, body);
+        else thread.lastChangedRevision = revision;
+      }
+    } else if (body.threadId === undefined) {
+      // An anonymous stop must prevent a late resume response from overriding newer evidence.
+      for (const thread of this.threadsById.values()) thread.lastChangedRevision = revision;
+    }
+    if (body.threadId !== undefined) {
+      const thread = this.getOrCreateThread(body.threadId);
+      this.setStopped(thread, revision, body);
+      this.lastStoppedThreadId = body.threadId;
     }
     this.notifyChange();
   }
 
-  private invalidateThreads(event: DebugProtocol.InvalidatedEvent): void {
-    const revision = ++this.revision;
-    const threadIds = event.body?.threadId !== undefined ? [event.body.threadId] : [...this.threadsById.keys()];
-    for (const id of threadIds) {
-      const thread = this.threadsById.get(id);
-      if (!thread) continue;
-      thread.executionRevision++;
-      thread.lastRevision = revision;
-    }
-    this.notifyChange();
+  private setStopped(thread: ThreadRecord, revision: number, body: DebugProtocol.StoppedEvent["body"]): void {
+    thread.state = "stopped";
+    thread.stopRevision = revision;
+    thread.lastChangedRevision = revision;
+    thread.stop = body;
   }
 
-  private handleReverseRequest(request: DebugProtocol.Request): void {
-    if (this.isClosed) return;
-    this.adapter.sendResponse({
-      seq: 0,
-      type: "response",
-      request_seq: request.seq,
-      command: request.command,
-      success: false,
-      message: `Reverse request '${request.command}' is not supported by pi-debug.`,
-    });
+  private setRunning(thread: ThreadRecord, revision: number): void {
+    thread.state = "running";
+    thread.stopRevision = undefined;
+    thread.stop = undefined;
+    thread.lastChangedRevision = revision;
   }
 
-  private handleAdapterError(error: Error): void {
-    void this.beginClose({ kind: "error", message: error.message });
-  }
-
-  private handleAdapterExit(code: number | null): void {
-    if (this.isClosed) return;
-    this.adapterExited = true;
-    void this.beginClose({
-      kind: "error",
-      message: `Debug adapter exited unexpectedly${code === null ? "." : ` with code ${code}.`}`,
-    });
-  }
-
-  // State and request utilities
-
-  private mergeCapabilities(capabilities: DebugProtocol.Capabilities | undefined): void {
-    if (capabilities) Object.assign(this.capabilities, capabilities);
-  }
-
-  private getOrCreateThread(id: number): Thread {
+  private getOrCreateThread(id: number): ThreadRecord {
     let thread = this.threadsById.get(id);
     if (!thread) {
-      thread = { id, state: "unknown", executionRevision: 0, lastRevision: 0 };
+      thread = { id, state: "unknown", lastChangedRevision: this.revision };
       this.threadsById.set(id, thread);
     }
     return thread;
   }
 
-  private notifyChange(): void {
-    for (const listener of [...this.changeListeners]) listener();
+  private async closeOnce(reason: SessionEndReason): Promise<void> {
+    const errors: string[] = [];
+    try {
+      await this.transportStart?.catch(() => undefined);
+      if (this.initializedCompleted && this.launchDispatched && !this.transportFailed) {
+        const args: DebugProtocol.DisconnectArguments = {};
+        if (this.capabilities.supportTerminateDebuggee) {
+          args.terminateDebuggee = this.configuration.request === "launch";
+        }
+        try {
+          await this.client.request("disconnect", args, { timeoutMs: DISCONNECT_TIMEOUT_MS });
+        } catch (error) {
+          errors.push(`disconnect: ${errorMessage(error)}`);
+        }
+      }
+      try {
+        await this.adapter.stopSession();
+      } catch (error) {
+        errors.push(`stopSession: ${errorMessage(error)}`);
+      }
+    } finally {
+      try {
+        this.adapter.dispose();
+      } catch (error) {
+        errors.push(`dispose: ${errorMessage(error)}`);
+      }
+      this.state = {
+        state: "closed",
+        reason,
+        ...(errors.length ? { cleanupError: errors.join("; ") } : {}),
+      };
+      this.notifyChange();
+    }
+  }
+
+  private handleTransportFailure(error: Error): void {
+    if (this.state.state === "closing" || this.state.state === "closed") return;
+    this.transportFailed = true;
+    void this.close({ kind: "error", message: error.message });
+  }
+
+  private handleReverseRequest(request: DebugProtocol.Request): void {
+    if (this.state.state === "closed") return;
+    try {
+      this.adapter.sendResponse({
+        seq: 0,
+        type: "response",
+        request_seq: request.seq,
+        command: request.command,
+        success: false,
+        message: `Reverse request '${request.command}' is not supported.`,
+      });
+    } catch (error) {
+      this.handleTransportFailure(error instanceof Error ? error : new Error(String(error)));
+    }
+  }
+
+  private async call<C extends keyof DapRequestMap>(
+    command: C,
+    args: DapRequestMap[C][0],
+    timeoutMs: number,
+    signal?: AbortSignal,
+  ): Promise<DapRequestMap[C][1]> {
+    const operationSignal = this.operationSignal(signal);
+    throwIfAborted(operationSignal);
+    return observe(this.client.request(command, args, { timeoutMs }), operationSignal);
+  }
+
+  private operationSignal(signal?: AbortSignal): AbortSignal {
+    return signal ? AbortSignal.any([signal, this.lifetime.signal]) : this.lifetime.signal;
+  }
+
+  private async withOperation<T>(work: () => Promise<T>, signal?: AbortSignal, allowPending = false): Promise<T> {
+    throwIfAborted(signal);
+    if (this.busy || (this.pendingExecution && !allowPending)) {
+      throw new DebugError("OPERATION_CONFLICT", "Another debug operation is still in progress.");
+    }
+    this.busy = true;
+    try {
+      return await work();
+    } finally {
+      this.busy = false;
+    }
   }
 
   private assertActive(): void {
     if (this.state.state !== "active") {
-      throw new Error(`Debug session is not active; current state is '${this.state.state}'.`);
+      throw new DebugError("INVALID_STATE", `Debug session is ${this.state.state}.`, { state: this.state.state });
     }
   }
 
-  private async withMutation<T>(operation: () => Promise<T>): Promise<T> {
-    const previous = this.mutationTail;
-    let release!: () => void;
-    this.mutationTail = new Promise<void>((resolvePromise) => {
-      release = resolvePromise;
-    });
-    await previous;
-    try {
-      return await operation();
-    } finally {
-      release();
+  private assertWaitMs(waitMs: number): void {
+    if (!Number.isInteger(waitMs) || waitMs < 0 || waitMs > 30_000) {
+      throw new DebugError("INVALID_ARGUMENT", "waitMs must be an integer from 0 to 30000.");
     }
   }
 
-  private async request<C extends keyof DapRequestMap>(
-    command: C,
-    args: DapRequestMap[C][0],
-    timeoutMs: number,
-    signal?: AbortSignal,
-  ): Promise<DapRequestMap[C][1]> {
-    const combined = signal ? AbortSignal.any([signal, this.lifetime.signal]) : this.lifetime.signal;
-    const response = await this.sendRequest(command, args, timeoutMs, combined);
-    combined.throwIfAborted();
-    return response;
+  private assertPage(page: PageOptions): void {
+    if (
+      !Number.isInteger(page.start) ||
+      page.start < 0 ||
+      !Number.isInteger(page.count) ||
+      page.count < 1 ||
+      page.count > 100
+    ) {
+      throw new DebugError("INVALID_ARGUMENT", "Page start must be non-negative and count must be from 1 to 100.");
+    }
   }
 
-  private sendRequest<C extends keyof DapRequestMap>(
-    command: C,
-    args: DapRequestMap[C][0],
-    timeoutMs: number,
-    signal?: AbortSignal,
-  ): Promise<DapRequestMap[C][1]> {
-    return new Promise<DapRequestMap[C][1]>((resolvePromise, rejectPromise) => {
-      if (signal?.aborted) {
-        rejectPromise(abortError(signal));
-        return;
-      }
-      let settled = false;
-      const aborted = (): void => {
-        if (settled) return;
-        settled = true;
-        signal?.removeEventListener("abort", aborted);
-        rejectPromise(abortError(signal));
-      };
-      signal?.addEventListener("abort", aborted, { once: true });
-      try {
-        this.adapter.sendRequest(
-          command,
-          args,
-          (response) => {
-            if (settled) return;
-            settled = true;
-            signal?.removeEventListener("abort", aborted);
-            // TODO 判断 command 是否为 dap 层返回的哨兵值 "canceled"
-            if (!response.success) {
-              rejectPromise(new Error(formatResponseError(response)));
-              return;
-            }
-            resolvePromise(response as DapRequestMap[C][1]);
-          },
-          timeoutMs,
-        );
-      } catch (error) {
-        settled = true;
-        signal?.removeEventListener("abort", aborted);
-        rejectPromise(error);
-      }
-    });
+  private threadSnapshot(thread: ThreadRecord): ThreadSnapshot {
+    return {
+      id: thread.id,
+      ...(thread.name !== undefined ? { name: thread.name } : {}),
+      state: thread.state,
+      ...(thread.state === "stopped" && thread.stopRevision !== undefined && thread.stop
+        ? { revision: thread.stopRevision, stop: structuredClone(thread.stop) }
+        : {}),
+    };
   }
-}
 
-function abortError(signal?: AbortSignal): Error {
-  return signal?.reason instanceof Error ? signal.reason : new Error("Operation aborted.");
-}
+  private stoppedThread(thread: ThreadRecord): StoppedThread {
+    return this.threadSnapshot(thread) as StoppedThread;
+  }
 
-function withTimeout<T>(promise: Promise<T>, timeoutMs: number, operation: string, signal: AbortSignal): Promise<T> {
-  return new Promise<T>((resolvePromise, rejectPromise) => {
-    signal.throwIfAborted();
-    const cleanup = (): void => {
-      clearTimeout(timer);
-      signal.removeEventListener("abort", aborted);
+  private page<T>(items: readonly T[], options: PageOptions): Page<T> {
+    const selected = items.slice(options.start, options.start + options.count);
+    return { ...this.pageInfo(options, selected.length, items.length), items: selected };
+  }
+
+  private pageInfo(options: PageOptions, length: number, total?: number): PageInfo {
+    const next = options.start + length;
+    return {
+      ...options,
+      ...(total !== undefined ? { total } : {}),
+      ...(length === options.count && (total === undefined || next < total) ? { nextStart: next } : {}),
     };
-    const aborted = (): void => {
-      cleanup();
-      rejectPromise(abortError(signal));
-    };
-    const timer = setTimeout(() => {
-      cleanup();
-      rejectPromise(new Error(`Timed out waiting for ${operation}.`));
-    }, timeoutMs);
-    signal.addEventListener("abort", aborted, { once: true });
-    promise.then(
-      (value) => {
-        cleanup();
-        resolvePromise(value);
-      },
-      (error) => {
-        cleanup();
-        rejectPromise(error);
-      },
-    );
-  });
+  }
 }
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
-}
-
-function formatResponseError(response: DebugProtocol.Response): string {
-  const errorResponse = response as DebugProtocol.ErrorResponse;
-  const error = errorResponse.body?.error;
-  if (!error) return response.message || `Debug adapter rejected '${response.command}'.`;
-
-  return error.format.replace(/{([^{}]+)}/g, (placeholder, name: string) => error.variables?.[name] ?? placeholder);
-}
-
-function toThreadSnapshot(thread: Thread): ThreadSnapshot {
-  return {
-    id: thread.id,
-    ...(thread.name ? { name: thread.name } : {}),
-    state: thread.state,
-    ...(thread.stop ? { stop: thread.stop } : {}),
-  };
 }

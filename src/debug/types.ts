@@ -1,209 +1,146 @@
 import type { DebugProtocol } from "@vscode/debugprotocol";
 import type { DebugConfiguration } from "../config/launch-config.js";
 
-export type SessionState =
-  | {
-      state: "starting";
-    }
-  | {
-      state: "active";
-    }
-  | {
-      state: "closing";
-      reason: SessionEndReason;
-    }
-  | {
-      state: "closed";
-      reason: SessionEndReason;
-      cleanupError?: string;
-    };
-
+/** The first reason that initiated session cleanup. */
 export type SessionEndReason = { kind: "requested" } | { kind: "terminated" } | { kind: "error"; message: string };
 
+/** Local control lifecycle; closed does not guarantee successful resource release. */
+export type SessionState =
+  | { state: "starting" }
+  | { state: "active" }
+  | { state: "closing"; reason: SessionEndReason }
+  | { state: "closed"; reason: SessionEndReason; cleanupError?: string };
+
+/** Debuggee exit information, independent of the session lifecycle. */
 export interface DebuggeeExit {
   exitCode: number;
 }
 
-export interface SessionStatus {
-  configuration: Pick<DebugConfiguration, "name" | "type" | "request">;
-  capabilities: Pick<DebugProtocol.Capabilities, "supportsSingleThreadExecutionRequests">;
-  state: SessionState;
-  threads: ThreadSnapshot[];
-  debuggeeExit?: DebuggeeExit;
-}
-
+/** Execution state justified by the events and responses received so far. */
 export type ThreadState = "unknown" | "running" | "stopped" | "exited";
 
-export interface SourceBreakpoints {
-  file: string;
-  lines: readonly number[];
-}
-
-export interface SessionStartOptions {
-  breakpoints: readonly SourceBreakpoints[];
-  waitMs: number;
-}
-
-export interface ResumeOptions {
-  threadId?: number;
-  singleThread: boolean;
-  waitMs: number;
-}
-
-export interface PauseOptions {
-  threadId?: number;
-  waitMs: number;
-}
-
-export interface WaitOptions {
-  threadId?: number;
-  waitMs: number;
-}
-
-export interface PaginationOptions {
-  start: number;
-  count: number;
-}
-
-export interface StackTraceOptions extends PaginationOptions {
-  threadId?: number;
-}
-
-interface VariablesPageOptions extends PaginationOptions {
-  threadId?: number;
-}
-
-export type VariablesOptions = VariablesPageOptions &
-  (
-    | { variablesReference?: undefined; frame: number; scope: string }
-    | { variablesReference: number; frame?: never; scope?: never }
-  );
-
-export interface EvaluateOptions {
-  threadId?: number;
-  frame: number;
-  expression: string;
-}
-
-export interface InspectOptions {
-  threadId?: number;
-  frame: number;
-  scope?: string;
-}
-
-export interface OutputOptions extends PaginationOptions {
-  category?: string;
-}
-
-/** A stack frame at its zero-based position in one stopped thread's call stack. */
-export interface Frame {
-  index: number;
-  data: DebugProtocol.StackFrame;
-}
-
-/** A stopped event and the stack frame session could resolve for it. */
-export interface Stop {
-  event: DebugProtocol.StoppedEvent["body"];
-  topFrame?: Frame;
-}
-
-/** One debuggee thread and the execution state tracked by this session. */
+/** One thread; stop and revision are available only while it remains stopped. */
 export interface ThreadSnapshot {
   id: number;
   name?: string;
   state: ThreadState;
-  stop?: Stop;
+  stop?: DebugProtocol.StoppedEvent["body"];
+  revision?: number;
 }
 
-/** A DAP scope. */
-export type Scope = DebugProtocol.Scope;
+/** A current stopped thread with a usable inspection revision. */
+export type StoppedThread = ThreadSnapshot & {
+  state: "stopped";
+  revision: number;
+  stop: DebugProtocol.StoppedEvent["body"];
+};
 
-/** A DAP variable. */
-export type Variable = DebugProtocol.Variable;
+/** A detached snapshot of locally observed session state. */
+export interface SessionSnapshot {
+  configuration: Pick<DebugConfiguration, "name" | "type" | "request">;
+  capabilities: Pick<DebugProtocol.Capabilities, "supportsSingleThreadExecutionRequests">;
+  state: SessionState;
+  revision: number;
+  threads: ThreadSnapshot[];
+  debuggeeExit?: DebuggeeExit;
+}
 
-/** A DAP breakpoint associated with one source. */
-export type Breakpoint = DebugProtocol.Breakpoint;
+/** Stop waits at most five seconds per call and may leave cleanup in progress. */
+export type StopResult =
+  | { kind: "noSession" }
+  | { kind: "closing"; snapshot: SessionSnapshot }
+  | { kind: "closed"; snapshot: SessionSnapshot };
 
-/** One buffered DAP output event. */
-export type Output = DebugProtocol.OutputEvent["body"];
+/** Source breakpoint replacement, with one-based line numbers. */
+export interface SourceBreakpoints {
+  file: string;
+  lines: number[];
+}
 
-/** A page of a resource collection. `total` is present only when known exactly. */
-export interface Page<T> {
+export interface StartOptions {
+  breakpoints: SourceBreakpoints[];
+  waitMs: number;
+  /** Absolute deadline shared with configuration and adapter creation. */
+  deadline: number;
+}
+
+/** Original breakpoint response associated with its requested source. */
+export interface BreakpointsResult {
+  source: DebugProtocol.Source;
+  body: DebugProtocol.SetBreakpointsResponse["body"];
+}
+
+/** Select a thread and optionally require its current stop revision. */
+export interface ThreadSelection {
+  threadId?: number;
+  revision?: number;
+}
+
+/** Supported execution commands, distinct from passive waiting. */
+export type ExecuteAction = "continue" | "next" | "step_in" | "step_out" | "pause";
+
+/** Execution selection and observation budget after the request succeeds. */
+export interface ExecuteOptions {
+  threadId?: number;
+  singleThread?: boolean;
+  waitMs: number;
+}
+
+/** Passive observation; revision excludes current stops at or below that value. */
+export interface WaitOptions extends ThreadSelection {
+  waitMs: number;
+}
+
+/** Normal outcomes of execution or observation, including an exhausted wait budget. */
+export type ExecutionOutcome =
+  | { kind: "stopped"; thread: StoppedThread }
+  | { kind: "stopped"; revision: number; stop: DebugProtocol.StoppedEvent["body"] }
+  | { kind: "threadExited"; threadId: number }
+  | { kind: "timeout"; status: SessionSnapshot }
+  | { kind: "closed"; status: SessionSnapshot };
+
+/** Zero-based pagination of one selected list. */
+export interface PageOptions {
   start: number;
-  items: T[];
+  count: number;
+}
+
+/** Metadata for an already selected page; unknown totals are omitted. */
+export interface PageInfo extends PageOptions {
   nextStart?: number;
   total?: number;
 }
 
-/** Local source text read by the session as inspection context. */
-export interface SourceContext {
-  path: string;
-  lines: {
-    line: number;
-    content: string;
-  }[];
+/** Current-page items retain their complete original fields. */
+export interface Page<T> extends PageInfo {
+  items: T[];
 }
 
-export type ExecutionOutcome =
-  | {
-      kind: "stopped";
-      thread: ThreadSnapshot;
-    }
-  | {
-      kind: "threadExited";
-      threadId: number;
-    }
-  | {
-      kind: "timeout";
-      status: SessionStatus;
-    }
-  | {
-      kind: "closed";
-      status: SessionStatus;
-    };
-
-export interface BreakpointSet {
-  source: DebugProtocol.Source;
-  breakpoints: Breakpoint[];
+export interface OutputOptions extends PageOptions {
+  category?: string;
 }
 
-export interface StartResult {
-  execution: ExecutionOutcome;
-  breakpoints: BreakpointSet[];
-}
-
-export interface SetBreakpointsResult {
-  breakpoints: BreakpointSet;
-}
-
-export interface StackTrace {
-  threadId: number;
-  stack: Page<Frame>;
-}
-
-export type VariableContainer =
-  | { kind: "scope"; frameIndex: number; scope: Scope }
-  | { kind: "variable"; variablesReference: number };
-
-export interface Variables {
-  threadId: number;
-  container: VariableContainer;
-  variables: Page<Variable>;
-}
-
-export interface Evaluation {
-  threadId: number;
+/** Select a zero-based stack position, not an adapter frame identifier. */
+export interface FrameSelection extends ThreadSelection {
   frameIndex: number;
-  data: DebugProtocol.EvaluateResponse["body"];
 }
 
-export interface Inspection {
-  thread: ThreadSnapshot;
-  stack: Page<Frame>;
-  selection: {
-    frame: Frame;
-    scopes: Scope[];
-    variables?: Variables;
-    sourceContext?: SourceContext;
-  };
+/** Select a scope or expand a reference from the same session and thread stop. */
+export type VariablesSelection =
+  | (FrameSelection & { scope: string; variablesReference?: never })
+  | { threadId?: number; revision: number; variablesReference: number; frameIndex?: never; scope?: never };
+
+/** Stop credentials captured and checked throughout an inspection. */
+export interface StopContext {
+  threadId: number;
+  revision: number;
 }
+
+/** An original response body tied to the locally validated stop. */
+export type Inspection<T> = StopContext & { body: T };
+
+/** A stack response containing only the selected page of complete frames. */
+export type StackResult = Inspection<DebugProtocol.StackTraceResponse["body"]> & { page: PageInfo };
+
+/** A variables response containing only the selected page of complete variables. */
+export type VariablesResult = Inspection<DebugProtocol.VariablesResponse["body"]> & { page: PageInfo };
