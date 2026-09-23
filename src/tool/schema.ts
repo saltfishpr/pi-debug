@@ -79,32 +79,26 @@ const functionBreakpointSpecSchema = Type.Object(
 );
 
 export const parameters = Type.Object({
-  action: StringEnum(
-    [
-      "configurations",
-      "start",
-      "status",
-      "stop",
-      "set_breakpoints",
-      "set_function_breakpoints",
-      "list_breakpoints",
-      "continue",
-      "next",
-      "step_in",
-      "step_out",
-      "pause",
-      "wait",
-      "threads",
-      "stack_trace",
-      "variables",
-      "evaluate",
-      "output",
-    ] as const,
-    {
-      description:
-        "Select an operation: `configurations` finds saved launch settings; `start` creates a session; `status` returns the current session snapshot, including `busy` when another operation is in flight; `stop` requests cleanup; `set_breakpoints` replaces one file's breakpoints; `set_function_breakpoints` replaces the global function-name breakpoint list; `list_breakpoints` returns every breakpoint currently installed in the session (source, function, and exception). `continue` resumes, `next` steps over, `step_in` enters, `step_out` returns, and `pause` interrupts. `wait` observes without controlling execution; `threads` refreshes the thread list; `stack_trace` lists frames; `variables` reads a scope or expands a value; `evaluate` runs an expression; `output` reads buffered events.",
-    },
-  ),
+  action: StringEnum([
+    "configurations",
+    "start",
+    "status",
+    "stop",
+    "set_breakpoints",
+    "set_function_breakpoints",
+    "list_breakpoints",
+    "continue",
+    "next",
+    "step_in",
+    "step_out",
+    "pause",
+    "wait",
+    "threads",
+    "stack_trace",
+    "variables",
+    "evaluate",
+    "output",
+  ] as const),
   configuration: Type.Optional(
     Type.Union(
       [
@@ -219,11 +213,12 @@ export const parameters = Type.Object({
         "For `variables`, expand one level of a value returned by `variables` or `evaluate`. Use its reference with the same thread's current stop `revision`; after resuming, fetch a new reference. Do not combine with `frameIndex` or `scope`.",
     }),
   ),
-  expression: Type.Optional(
-    Type.String({
-      minLength: 1,
+  expressions: Type.Optional(
+    Type.Array(Type.String({ minLength: 1 }), {
+      minItems: 1,
+      maxItems: 20,
       description:
-        "Required for `evaluate`: a non-empty expression in the target program's language, evaluated in the selected stopped frame. Calls or assignments may mutate the program.",
+        "Required for `evaluate`: one or more non-empty expressions in the target program's language, evaluated in order in the selected stopped frame. Each expression is a separate adapter request; calls or assignments may mutate the program, and an earlier expression's side effects are observed by later expressions in the same batch.",
     }),
   ),
   start: Type.Optional(

@@ -199,3 +199,11 @@ export type StackResult = Inspection<DebugProtocol.StackTraceResponse["body"]> &
 
 /** A variables response containing only the selected page of complete variables. */
 export type VariablesResult = Inspection<DebugProtocol.VariablesResponse["body"]> & { page: PageInfo };
+
+/** One expression's outcome within an evaluate batch; failures do not abort later expressions. */
+export type EvaluateOutcome =
+  | { expression: string; ok: true; body: DebugProtocol.EvaluateResponse["body"] }
+  | { expression: string; ok: false; error: { code: string; message: string } };
+
+/** Ordered per-expression outcomes sharing the batch's stop context. */
+export type EvaluateResult = Inspection<{ results: EvaluateOutcome[] }>;

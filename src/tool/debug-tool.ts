@@ -28,17 +28,19 @@ export function registerDebugTool(pi: ExtensionAPI, manager: DebugSessionManager
     name: "debug",
     label: "Debug",
     description: [
-      "Manage one program debugging session at a time. Use `configurations` to find saved launch settings, then `start` with a saved name or an inline launch/attach configuration; a new session requires the previous one to be closed.",
-      "In an active session, set breakpoints (source or function), control execution, inspect stopped threads, or evaluate expressions. `status` reports the session state and whether another operation is in flight (`busy`), `wait` observes stops or exits without controlling execution, `output` reads buffered output, and `stop` requests cleanup.",
-      "Execution controls may return after an observation timeout without stopping the program. `stop` may return while cleanup is still in progress and may terminate a launched program; evaluating expressions can change target state.",
+      "Manage one program debugging session at a time; a new session requires the previous one to be closed before another can start.",
+      "Discovery and lifecycle: `configurations` finds saved launch settings; `start` creates a session from a saved name or an inline launch/attach configuration; `status` returns the current session snapshot, including `busy` when another operation is in flight; `stop` requests cleanup and may return while cleanup is still in progress and may terminate a launched program.",
+      "Breakpoints: `set_breakpoints` replaces one file's breakpoints; `set_function_breakpoints` replaces the global function-name breakpoint list; `list_breakpoints` returns every breakpoint currently installed in the session (source, function, and exception).",
+      "Execution: `continue` resumes, `next` steps over, `step_in` enters, `step_out` returns, and `pause` interrupts; `wait` observes stops or exits without controlling execution.",
+      "Inspection: `threads` refreshes the thread list; `stack_trace` lists frames; `variables` reads a scope or expands a value; `evaluate` evaluates one or more expressions in order; `output` reads buffered events.",
     ].join(" "),
     promptSnippet:
       "Debug programs by controlling execution and inspecting runtime evidence when static analysis is insufficient.",
     promptGuidelines: [
-      "Use debug to test a specific runtime hypothesis: set targeted breakpoints (use `initialBreakpoints` for startup code) and inspect relevant stack frames and variables instead of repeatedly stepping without a question.",
-      "Use debug `status` or `threads` when session state or thread selection is unclear; use the stopped thread's current revision when expanding a `variablesReference`, and refresh inspection after it resumes.",
+      "Use debug to test a concrete runtime hypothesis: stop where the evidence can distinguish possible causes, inspect the state, revise the hypothesis and repeat until the behavior is explained, then stop the session.",
+      "Use debug `status` or `threads` when session state or thread selection is unclear.",
       "Use debug `wait` or `status` after an observation timeout rather than assuming execution stopped; avoid debug `evaluate` expressions with side effects unless necessary.",
-      "Use debug `wait` with a `threadId` and no `revision` to retrieve that thread's current stop (revision and stop body) without waiting for a new event; a `waitMs` of 0 makes this a non-blocking query.",
+      "Use debug `wait` with a `threadId` and no `revision` to retrieve that thread's current stop (revision and stop body) without waiting for a new event.",
       "Use debug `stop` when finished; if it reports `closing`, check debug `status` before starting another session.",
     ],
     parameters,
@@ -158,14 +160,14 @@ export function registerDebugTool(pi: ExtensionAPI, manager: DebugSessionManager
             return done(resultText(formatVariablesResult(result)));
           }
           case "evaluate": {
-            if (!args.expression?.trim()) {
-              throw new DebugError("INVALID_ARGUMENT", "`evaluate` requires a non-empty expression.");
+            if (!args.expressions || args.expressions.length === 0) {
+              throw new DebugError("INVALID_ARGUMENT", "`evaluate` requires a non-empty `expressions` array.");
             }
             const result = await manager
               .get()
               .evaluate(
                 { threadId: args.threadId, revision: args.revision, frameIndex: args.frameIndex ?? 0 },
-                args.expression,
+                args.expressions,
                 signal,
               );
             return done(resultText(formatEvaluateResult(result)));

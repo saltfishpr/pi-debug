@@ -7,6 +7,8 @@ import { DapClient } from "./dap-client.js";
 import { abortError, DebugError, throwIfAborted } from "./errors.js";
 import type {
   BreakpointsSnapshot,
+  EvaluateOutcome,
+  EvaluateResult,
   ExceptionBreakpointsResult,
   ExecuteAction,
   ExecuteOptions,
@@ -15,7 +17,6 @@ import type {
   FunctionBreakpointSpec,
   FunctionBreakpointsResult,
   InitialBreakpoints,
-  Inspection,
   OutputOptions,
   Page,
   PageInfo,
@@ -504,24 +505,36 @@ export class DebugSession {
     }, signal);
   }
 
-  /** Evaluate in a selected stopped frame; expressions may have target-side effects. */
-  async evaluate(
-    selection: FrameSelection,
-    expression: string,
-    signal?: AbortSignal,
-  ): Promise<Inspection<DebugProtocol.EvaluateResponse["body"]>> {
+  /** Evaluate expressions in a selected stopped frame in order; expressions may have target-side effects observable by later expressions. */
+  async evaluate(selection: FrameSelection, expressions: string[], signal?: AbortSignal): Promise<EvaluateResult> {
     return this.withOperation(async () => {
-      if (!expression.trim()) throw new DebugError("INVALID_ARGUMENT", "Expression must not be empty.");
+      if (expressions.length === 0) throw new DebugError("INVALID_ARGUMENT", "Expressions must not be empty.");
+      for (const expression of expressions) {
+        if (!expression.trim()) throw new DebugError("INVALID_ARGUMENT", "Expression must not be empty.");
+      }
       const stop = this.selectStoppedThread(selection);
       const frame = await this.resolveFrame(stop, selection.frameIndex, signal);
-      const response = await this.call(
-        "evaluate",
-        { expression, frameId: frame.id, context: "watch" },
-        REQUEST_TIMEOUT_MS,
-        signal,
-      );
-      this.assertStop(stop);
-      return { ...stop, body: response.body };
+      const results: EvaluateOutcome[] = [];
+      for (const expression of expressions) {
+        this.assertStop(stop);
+        try {
+          const response = await this.call(
+            "evaluate",
+            { expression, frameId: frame.id, context: "watch" },
+            REQUEST_TIMEOUT_MS,
+            signal,
+          );
+          this.assertStop(stop);
+          results.push({ expression, ok: true, body: response.body });
+        } catch (error) {
+          if (error instanceof DebugError && error.code === "REQUEST_REJECTED") {
+            results.push({ expression, ok: false, error: { code: error.code, message: error.message } });
+            continue;
+          }
+          throw error;
+        }
+      }
+      return { ...stop, body: { results } };
     }, signal);
   }
 

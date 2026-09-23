@@ -629,7 +629,7 @@ Inline 配置保留 Adapter 专属字段：
 
 ### `evaluate`
 
-在 stopped 线程的选中 frame 中以 DAP `watch` context 求值。表达式可能调用函数或修改状态，因此默认应使用只读表达式。
+在 stopped 线程的选中 frame 中以 DAP `watch` context 求值一组表达式。表达式按数组顺序串行发起 Adapter 请求，共享同一 stop 上下文；表达式可能调用函数或修改状态，前一个表达式的副作用会被后续表达式观察到，因此默认应使用只读表达式。
 
 **入参**
 
@@ -639,11 +639,11 @@ Inline 配置保留 Adapter 专属字段：
   "threadId": 1,
   "revision": 12,
   "frameIndex": 0,
-  "expression": "a + b"
+  "expressions": ["a + b", "user.name"]
 }
 ```
 
-`expression` 必填且非空；`frameIndex` 默认 `0`；`revision` 可选，提供后验证线程仍处于同一次 stop。
+`expressions` 必填，为长度 1..20 的字符串数组，每项非空；`frameIndex` 默认 `0`；`revision` 可选，提供后验证线程仍处于同一次 stop。
 
 **结果示例**
 
@@ -651,16 +651,28 @@ Inline 配置保留 Adapter 专属字段：
 {
   "threadId": 1,
   "revision": 12,
-  "result": {
-    "value": "main.User {...}",
-    "type": "main.User",
-    "variablesReference": 2001,
-    "namedVariables": 2
-  }
+  "results": [
+    {
+      "expression": "a + b",
+      "value": "5",
+      "type": "int"
+    },
+    {
+      "expression": "user.name",
+      "value": "\"alice\"",
+      "type": "string",
+      "variablesReference": 2001,
+      "namedVariables": 2
+    },
+    {
+      "expression": "missing",
+      "error": { "code": "EVALUATE_FAILED", "message": "undefined identifier 'missing'" }
+    }
+  ]
 }
 ```
 
-`result` 的字段与 `variables` 项一致：`variablesReference` 大于 0 时可用于继续 `variables` 展开，只在当前 stop 状态有效。
+`results` 与入参 `expressions` 等长且同序，每一项显式回填 `expression` 原文。成功项字段与 `variables` 项一致：`variablesReference` 大于 0 时可用于继续 `variables` 展开，只在当前 stop 状态有效。单个表达式失败时该项以 `{ expression, error: { code, message } }` 结构记录，其余表达式继续求值；批中途若线程恢复或被新 stop 覆盖，整批立即中止并返回 `STALE_REVISION`。
 
 ### `output`
 

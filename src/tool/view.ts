@@ -3,9 +3,9 @@ import type { DebugConfiguration } from "../config/launch-config.js";
 import { DebugError } from "../debug/errors.js";
 import type {
   BreakpointsSnapshot,
+  EvaluateResult,
   ExecutionOutcome,
   FunctionBreakpointsResult,
-  Inspection,
   Page,
   SessionSnapshot,
   SourceBreakpointsResult,
@@ -142,14 +142,19 @@ export function formatVariablesResult(result: VariablesResult) {
   };
 }
 
-export function formatEvaluateResult(result: Inspection<DebugProtocol.EvaluateResponse["body"]>) {
+export function formatEvaluateResult(result: EvaluateResult) {
   return {
     threadId: result.threadId,
     revision: result.revision,
-    result: {
-      value: formatValue(result.body.result),
-      ...formatVariable(result.body),
-    },
+    results: result.body.results.map((outcome) =>
+      outcome.ok
+        ? {
+            expression: outcome.expression,
+            value: formatValue(outcome.body.result),
+            ...formatVariable(outcome.body),
+          }
+        : { expression: outcome.expression, error: outcome.error },
+    ),
   };
 }
 
