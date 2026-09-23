@@ -785,19 +785,25 @@ export class DebugSession {
     if (selectedThreadId !== undefined && this.threadsById.get(selectedThreadId)?.state === "exited") {
       return { kind: "threadExited", threadId: selectedThreadId };
     }
+    if (this.lastStop && this.lastStop.revision > baseline) {
+      if (this.lastStop.threadId === undefined) {
+        return { kind: "stopped", revision: this.lastStop.revision, stop: structuredClone(this.lastStop.body) };
+      }
+      const trigger = this.threadsById.get(this.lastStop.threadId);
+      if (trigger?.state === "stopped" && trigger.stopRevision === this.lastStop.revision) {
+        return { kind: "stopped", thread: this.stoppedThread(trigger) };
+      }
+    }
     const stopped = [...this.threadsById.values()]
       .filter(
-        (thread) => thread.state === "stopped" && thread.stopRevision !== undefined && thread.stopRevision > baseline,
+        (thread) =>
+          thread.state === "stopped" &&
+          thread.stopRevision !== undefined &&
+          thread.stopRevision > baseline &&
+          thread.stop?.threadId === thread.id,
       )
       .sort((a, b) => b.stopRevision! - a.stopRevision!);
     if (stopped.length) return { kind: "stopped", thread: this.stoppedThread(stopped[0]) };
-    if (
-      this.lastStop?.revision !== undefined &&
-      this.lastStop.revision > baseline &&
-      this.lastStop.threadId === undefined
-    ) {
-      return { kind: "stopped", revision: this.lastStop.revision, stop: structuredClone(this.lastStop.body) };
-    }
     return undefined;
   }
 

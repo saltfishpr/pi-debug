@@ -38,6 +38,7 @@ export function registerDebugTool(pi: ExtensionAPI, manager: DebugSessionManager
       "Use debug to test a specific runtime hypothesis: set targeted breakpoints (use `initialBreakpoints` for startup code) and inspect relevant stack frames and variables instead of repeatedly stepping without a question.",
       "Use debug `status` or `threads` when session state or thread selection is unclear; use the stopped thread's current revision when expanding a `variablesReference`, and refresh inspection after it resumes.",
       "Use debug `wait` or `status` after an observation timeout rather than assuming execution stopped; avoid debug `evaluate` expressions with side effects unless necessary.",
+      "Use debug `wait` with a `threadId` and no `revision` to retrieve that thread's current stop (revision and stop body) without waiting for a new event; a `waitMs` of 0 makes this a non-blocking query.",
       "Use debug `stop` when finished; if it reports `closing`, check debug `status` before starting another session.",
     ],
     parameters,

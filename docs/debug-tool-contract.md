@@ -13,7 +13,7 @@
 
 ### 公共选择和分页规则
 
-- `threadId` 来自 `threads` 或 stopped 结果。检查、继续和单步操作省略它时，优先选择最近停止的线程；否则仅在恰好有一个 stopped 线程时自动选择。
+- `threadId` 来自 `threads` 或 stopped 结果。检查、继续和单步操作省略它时，优先选择最近停止的线程；否则仅在恰好有一个 stopped 线程时自动选择。未指定线程的执行或等待结果优先返回触发最近一次 stop 事件的线程；若显式等待另一线程且该事件使所有线程暂停，返回的线程可能不是触发者，此时以 `stop.threadId` 判断触发线程。
 - `frameIndex` 是线程调用栈中的 **zero-based 位置**，不是 DAP frame ID，默认 `0`。
 - `revision` 是 session 内部单调递增的整数，出现在两处：
   - 结果中：`status` / `stop` 快照顶层 `revision` 反映 session 最新状态版本。`ThreadSnapshot` 在 `state == "stopped"` 时携带引起此次 stop 的 `revision`。`stack_trace`、`variables`、`evaluate` 结果里的 `revision` 与所依赖的 stop revision 相同。线程一旦恢复或状态变化，先前的 `revision` 和一切 `variablesReference` 都失效。
@@ -42,7 +42,7 @@
   }
 }
 
-// stop 事件未标注 threadId 时用该结构
+// stop 事件未标注 threadId 时用该结构，不推测触发线程
 {
   "kind": "stopped",
   "revision": 12,

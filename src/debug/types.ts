@@ -28,7 +28,7 @@ export interface ThreadSnapshot {
   revision?: number;
 }
 
-/** A current stopped thread with a usable inspection revision. */
+/** A current stopped thread with a usable inspection revision; its stop event may have been triggered by another thread when all threads stopped. */
 export type StoppedThread = ThreadSnapshot & {
   state: "stopped";
   revision: number;
@@ -146,7 +146,7 @@ export interface WaitOptions extends ThreadSelection {
   waitMs: number;
 }
 
-/** Normal outcomes of execution or observation, including an exhausted wait budget. */
+/** Normal outcomes of execution or observation, including an exhausted wait budget. Without a thread selection, a stop with a known trigger returns that thread. */
 export type ExecutionOutcome =
   | { kind: "stopped"; thread: StoppedThread }
   | { kind: "stopped"; revision: number; stop: DebugProtocol.StoppedEvent["body"] }
