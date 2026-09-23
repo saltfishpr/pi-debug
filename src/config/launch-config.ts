@@ -16,29 +16,38 @@ const debugConfigurationSchema = z
 /** Named VS Code launch/attach configuration; adapter-specific fields are preserved. */
 export type DebugConfiguration = z.infer<typeof debugConfigurationSchema>;
 
-const launchFileSchema = z.object({ configurations: z.array(debugConfigurationSchema) }).loose();
+const configurationOverrideSchema = debugConfigurationSchema.partial().required({ name: true });
+const launchFileSchema = z.object({ configurations: z.array(configurationOverrideSchema) }).loose();
 
-/** Load and resolve project JSONC configurations; same-name Pi entries replace VS Code entries. */
+/** Load and resolve project JSONC configurations; later same-name entries override fields they define. */
 export async function loadDebugConfigurations(cwd: string): Promise<DebugConfiguration[]> {
   const paths = [join(cwd, ".vscode", "launch.json"), join(cwd, CONFIG_DIR_NAME, "launch.json")];
-  const configurations = (await Promise.all(paths.map(loadLaunchFile))).flat();
+  const launchFiles = await Promise.all(paths.map(loadLaunchFile));
   const merged: DebugConfiguration[] = [];
   const indexesByName = new Map<string, number>();
 
-  for (const configuration of configurations) {
-    const index = indexesByName.get(configuration.name);
-    if (index === undefined) {
-      indexesByName.set(configuration.name, merged.length);
-      merged.push(configuration);
-    } else {
-      merged[index] = configuration;
+  for (const [fileIndex, configurations] of launchFiles.entries()) {
+    for (const [configurationIndex, configuration] of configurations.entries()) {
+      const index = indexesByName.get(configuration.name);
+      const candidate = index === undefined ? configuration : { ...merged[index], ...configuration };
+      const result = debugConfigurationSchema.safeParse(candidate);
+      if (!result.success) {
+        throw new Error(`Invalid ${paths[fileIndex]}: ${formatIssues(result.error.issues, configurationIndex)}`);
+      }
+
+      if (index === undefined) {
+        indexesByName.set(configuration.name, merged.length);
+        merged.push(result.data);
+      } else {
+        merged[index] = result.data;
+      }
     }
   }
 
   return resolveVariables(merged, cwd);
 }
 
-async function loadLaunchFile(path: string): Promise<DebugConfiguration[]> {
+async function loadLaunchFile(path: string): Promise<z.infer<typeof configurationOverrideSchema>[]> {
   let text: string;
   try {
     text = await readFile(path, "utf8");
@@ -68,4 +77,10 @@ async function loadLaunchFile(path: string): Promise<DebugConfiguration[]> {
   }
 
   return result.data.configurations;
+}
+
+function formatIssues(issues: z.core.$ZodIssue[], configurationIndex: number): string {
+  return issues
+    .map((issue) => `configurations.${configurationIndex}.${issue.path.join(".")}: ${issue.message}`)
+    .join(", ");
 }

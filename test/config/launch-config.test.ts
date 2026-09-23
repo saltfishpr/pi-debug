@@ -35,26 +35,33 @@ describe("loadDebugConfigurations", () => {
   });
 
   it("支持 JSONC 注释和尾随逗号，保留 adapter 自定义字段", async () => {
-    await writeLaunch(".vscode", `{
+    await writeLaunch(
+      ".vscode",
+      `{
       // Debug configuration
       "version": "0.2.0",
       "configurations": [{
         "name": "Attach", "type": "go", "request": "attach",
         "processId": 123, "stopOnEntry": false,
       }],
-    }`);
+    }`,
+    );
     expect(await loadDebugConfigurations(cwd)).toEqual([
       { name: "Attach", type: "go", request: "attach", processId: 123, stopOnEntry: false },
     ]);
   });
 
-  it("Pi 同名配置完整替换 VS Code 配置，保留顺序并追加新配置", async () => {
+  it("Pi 同名配置按字段覆盖 VS Code 配置，保留顺序并追加新配置", async () => {
     const second = { ...launch, name: "Second" };
-    const override = { name: "Launch", type: "go", request: "attach", processId: 123 };
+    const override = { name: "Launch", request: "attach", processId: 123 };
     const third = { ...launch, name: "Third" };
     await writeLaunch(".vscode", { configurations: [launch, second] });
     await writeLaunch(CONFIG_DIR_NAME, { configurations: [override, third] });
-    expect(await loadDebugConfigurations(cwd)).toEqual([override, second, third]);
+    expect(await loadDebugConfigurations(cwd)).toEqual([
+      { ...launch, request: "attach", processId: 123 },
+      second,
+      third,
+    ]);
   });
 
   it("返回两个来源中已解析的配置，包括覆盖后的嵌套字段", async () => {
@@ -63,12 +70,14 @@ describe("loadDebugConfigurations", () => {
       configurations: [launch, { ...launch, name: "Second", program: "${workspaceFolder}/second.go" }],
     });
     await writeLaunch(CONFIG_DIR_NAME, {
-      configurations: [{
-        ...launch,
-        program: "${workspaceFolder}/main.go",
-        args: ["${env:PI_DEBUG_CONFIG_ARG}"],
-        custom: { cwd: "${workspaceFolder}", unknown: "${file}", enabled: true },
-      }],
+      configurations: [
+        {
+          ...launch,
+          program: "${workspaceFolder}/main.go",
+          args: ["${env:PI_DEBUG_CONFIG_ARG}"],
+          custom: { cwd: "${workspaceFolder}", unknown: "${file}", enabled: true },
+        },
+      ],
     });
     expect(await loadDebugConfigurations(cwd)).toEqual([
       {
