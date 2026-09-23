@@ -55,10 +55,10 @@
 { "kind": "threadExited", "threadId": 1 }
 
 // 等待预算耗尽
-{ "kind": "timeout", "status": { "...": "SessionStatus，见 status" } }
+{ "kind": "timeout", "snapshot": { "...": "SessionSnapshot，见 status" } }
 
 // session 完成关闭
-{ "kind": "closed", "status": { "...": "SessionStatus，见 status" } }
+{ "kind": "closed", "snapshot": { "...": "SessionSnapshot，见 status" } }
 ```
 
 ## 支持的 actions
@@ -173,7 +173,7 @@ Inline 配置保留 Adapter 专属字段：
 
 ### `status`
 
-返回 session 当前快照，不向 Adapter 刷新线程列表。顶层 `revision` 为 session 目前的版本号，每次线程状态变化递增。最多展示 50 个已跟踪线程，stopped 线程排在前面。
+返回 session 当前快照，不向 Adapter 刷新线程列表。顶层 `revision` 为 session 目前的版本号，每次线程状态变化递增。`threads` 列表最多展示 50 个线程，stopped 线程排在前面；`totalThreads` 始终反映完整线程数，`omittedThreads` 仅在发生截断时出现，需要完整列表时使用 `threads` action 翻页。
 
 **入参**
 

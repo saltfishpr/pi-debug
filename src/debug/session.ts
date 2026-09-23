@@ -369,7 +369,7 @@ export class DebugSession {
 
   /** Observe without sending a DAP request. */
   async wait(options: WaitOptions, signal?: AbortSignal): Promise<ExecutionOutcome> {
-    if (this.state.state === "closed") return { kind: "closed", status: this.snapshot() };
+    if (this.state.state === "closed") return { kind: "closed", snapshot: this.snapshot() };
     return this.withOperation(
       async () => {
         if (this.state.state === "starting") throw new DebugError("INVALID_STATE", "Debug session is still starting.");
@@ -704,13 +704,13 @@ export class DebugSession {
       const outcome = this.findOutcome(baseline, options.threadId, selectedThreadId);
       if (outcome) return outcome;
       const remaining = deadline - Date.now();
-      if (remaining <= 0) return { kind: "timeout", status: this.snapshot() };
+      if (remaining <= 0) return { kind: "timeout", snapshot: this.snapshot() };
       await this.waitForChange(remaining, signal);
     }
   }
 
   private findOutcome(baseline: number, threadId?: number, selectedThreadId?: number): ExecutionOutcome | undefined {
-    if (this.state.state === "closed") return { kind: "closed", status: this.snapshot() };
+    if (this.state.state === "closed") return { kind: "closed", snapshot: this.snapshot() };
     if (this.state.state === "closing") return undefined;
     if (threadId !== undefined) {
       const thread = this.threadsById.get(threadId);

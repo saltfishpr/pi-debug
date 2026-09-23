@@ -140,8 +140,8 @@ export type ExecutionOutcome =
   | { kind: "stopped"; thread: StoppedThread }
   | { kind: "stopped"; revision: number; stop: DebugProtocol.StoppedEvent["body"] }
   | { kind: "threadExited"; threadId: number }
-  | { kind: "timeout"; status: SessionSnapshot }
-  | { kind: "closed"; status: SessionSnapshot };
+  | { kind: "timeout"; snapshot: SessionSnapshot }
+  | { kind: "closed"; snapshot: SessionSnapshot };
 
 /** Zero-based pagination of one selected list. */
 export interface PageOptions {

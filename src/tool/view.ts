@@ -21,17 +21,30 @@ export function formatConfigurationsResult(configurations: DebugConfiguration[])
   };
 }
 
-export function formatSessionSnapshot(snapshot: SessionSnapshot): SessionSnapshot {
+const MAX_SNAPSHOT_THREADS = 50;
+
+type FormattedSessionSnapshot = SessionSnapshot & {
+  totalThreads: number;
+  omittedThreads?: number;
+};
+
+export function formatSessionSnapshot(snapshot: SessionSnapshot): FormattedSessionSnapshot {
+  const sorted = [...snapshot.threads].sort(
+    (a, b) => Number(b.state === "stopped") - Number(a.state === "stopped") || a.id - b.id,
+  );
+  const total = sorted.length;
+  const threads = sorted.slice(0, MAX_SNAPSHOT_THREADS);
+  const omitted = total - threads.length;
   return {
     ...snapshot,
-    threads: snapshot.threads
-      .sort((a, b) => Number(b.state === "stopped") - Number(a.state === "stopped") || a.id - b.id)
-      .slice(0, 50),
+    threads,
+    totalThreads: total,
+    ...(omitted > 0 ? { omittedThreads: omitted } : {}),
   };
 }
 
-export function formatExecutionOutcome(result: ExecutionOutcome): ExecutionOutcome {
-  return "status" in result ? { ...result, status: formatSessionSnapshot(result.status) } : result;
+export function formatExecutionOutcome(result: ExecutionOutcome) {
+  return "snapshot" in result ? { ...result, snapshot: formatSessionSnapshot(result.snapshot) } : result;
 }
 
 export function formatStartResult(result: { execution: ExecutionOutcome; breakpoints: InitialBreakpointsResult }) {
