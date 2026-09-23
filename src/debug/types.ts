@@ -92,28 +92,37 @@ export interface InitialBreakpoints {
   function?: FunctionBreakpointSpec[];
 }
 
+/** One file's installed source breakpoints: the requested specs and the DAP status for each, in request order. */
+export interface SourceBreakpointsResult {
+  source: DebugProtocol.Source;
+  specs: SourceBreakpointSpec[];
+  breakpoints: DebugProtocol.Breakpoint[];
+}
+
+/** The installed function-breakpoint list: the requested specs and the DAP status for each, in request order. */
+export interface FunctionBreakpointsResult {
+  specs: FunctionBreakpointSpec[];
+  breakpoints: DebugProtocol.Breakpoint[];
+}
+
+/** The installed exception-breakpoint filters; `breakpoints` is omitted when the adapter returns no per-filter status. */
+export interface ExceptionBreakpointsResult {
+  filters: string[];
+  breakpoints?: DebugProtocol.Breakpoint[];
+}
+
+/** Every breakpoint currently installed in the session; returned by `start` and `list_breakpoints`. */
+export interface BreakpointsSnapshot {
+  source: SourceBreakpointsResult[];
+  function?: FunctionBreakpointsResult;
+  exception?: ExceptionBreakpointsResult;
+}
+
 export interface StartOptions {
   breakpoints: InitialBreakpoints;
   waitMs: number;
   /** Absolute deadline shared with configuration and adapter creation. */
   deadline: number;
-}
-
-/** Original breakpoint response associated with its requested source. */
-export interface BreakpointsResult {
-  source: DebugProtocol.Source;
-  body: DebugProtocol.SetBreakpointsResponse["body"];
-}
-
-/** Original response body for a function-breakpoint replacement. */
-export interface FunctionBreakpointsResult {
-  body: DebugProtocol.SetFunctionBreakpointsResponse["body"];
-}
-
-/** Source and function breakpoints installed during startup, with each original DAP response. */
-export interface InitialBreakpointsResult {
-  source: BreakpointsResult[];
-  function?: FunctionBreakpointsResult;
 }
 
 /** Select a thread and optionally require its current stop revision. */

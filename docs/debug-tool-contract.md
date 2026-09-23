@@ -155,21 +155,33 @@ Inline 配置保留 Adapter 专属字段：
     "source": [
       {
         "source": { "path": "/workspace/main.go" },
+        "specs": [
+          { "line": 10 }
+        ],
         "breakpoints": [
           { "verified": true, "source": { "path": "/workspace/main.go" }, "line": 10 }
         ]
       }
     ],
     "function": {
+      "specs": [
+        { "name": "handleRequest" }
+      ],
       "breakpoints": [
         { "verified": true, "id": 3 }
+      ]
+    },
+    "exception": {
+      "filters": ["uncaught"],
+      "breakpoints": [
+        { "verified": true }
       ]
     }
   }
 }
 ```
 
-`breakpoints.source` 始终存在，未安装任何 source 断点时为 `[]`；`breakpoints.function` 只在入参提供了 `initialBreakpoints.function` 时出现，内容为 DAP `SetFunctionBreakpointsResponse.body`。
+`breakpoints.source` 始终存在，未安装任何 source 断点时为 `[]`。每一项都是 `{ source, specs, breakpoints }` 的组合：`specs` 是请求安装时提交的原始 spec 列表（不含清空情形），`breakpoints` 是 Adapter 汇报的 `DebugProtocol.Breakpoint` 数组，两者按请求顺序对齐。`breakpoints.function` 只在入参提供了 `initialBreakpoints.function` 时出现，结构相同。`breakpoints.exception` 只在 Adapter 汇报了默认 exception filter 时出现，`filters` 记录启动时下发的过滤器；`breakpoints` 由 Adapter 返回的 `SetExceptionBreakpointsResponse.body.breakpoints` 填充，Adapter 未返回状态时省略。
 
 ### `status`
 
@@ -284,6 +296,10 @@ Inline 配置保留 Adapter 专属字段：
 {
   "sourceBreakpoints": {
     "source": { "path": "/workspace/main.go" },
+    "specs": [
+      { "line": 10 },
+      { "line": 42, "condition": "n > 5" }
+    ],
     "breakpoints": [
       {
         "verified": true,
@@ -291,11 +307,18 @@ Inline 配置保留 Adapter 专属字段：
         "source": { "path": "/workspace/main.go", "name": "main.go" },
         "line": 10,
         "column": 1
+      },
+      {
+        "verified": true,
+        "source": { "path": "/workspace/main.go", "name": "main.go" },
+        "line": 42
       }
     ]
   }
 }
 ```
+
+`specs` 是本次请求提交的原始 spec 列表；`breakpoints` 是 Adapter 返回的 `DebugProtocol.Breakpoint` 数组，两者按请求顺序对齐。清空该文件断点时 `specs` 为 `[]`，`breakpoints` 由 Adapter 决定。
 
 ### `set_function_breakpoints`
 
@@ -321,6 +344,10 @@ Inline 配置保留 Adapter 专属字段：
 ```json
 {
   "functionBreakpoints": {
+    "specs": [
+      { "name": "main" },
+      { "name": "retry", "hitCondition": ">=3" }
+    ],
     "breakpoints": [
       { "verified": true, "id": 11 },
       { "verified": false, "message": "No function matched 'retry'." }
@@ -329,7 +356,53 @@ Inline 配置保留 Adapter 专属字段：
 }
 ```
 
-返回的 `breakpoints` 数组与入参一一对应，字段来自 DAP `SetFunctionBreakpointsResponse.body`。
+`specs` 是本次请求提交的函数断点列表；`breakpoints` 与其一一对应，字段来自 DAP `SetFunctionBreakpointsResponse.body`。清空所有函数断点时 `specs` 为 `[]`。
+
+### `list_breakpoints`
+
+返回 session 内已安装的全部断点，覆盖 source、function、exception 三类。不会向 Adapter 发起新的请求，仅返回 session 自身通过历次 `start` / `set_breakpoints` / `set_function_breakpoints` 累积的记录，并按 DAP `breakpoint` 事件同步 `verified`、`message` 等状态。session 尚未启动时返回 `NO_SESSION`；session 处于 `closing` / `closed` 时依然可读，反映最后一次安装的快照。
+
+**入参**
+
+```json
+{ "action": "list_breakpoints" }
+```
+
+**结果示例**
+
+```json
+{
+  "source": [
+    {
+      "source": { "path": "/workspace/main.go" },
+      "specs": [
+        { "line": 10 },
+        { "line": 42, "condition": "n > 5" }
+      ],
+      "breakpoints": [
+        { "verified": true, "id": 1, "line": 10 },
+        { "verified": true, "id": 2, "line": 42 }
+      ]
+    }
+  ],
+  "function": {
+    "specs": [
+      { "name": "handleRequest" }
+    ],
+    "breakpoints": [
+      { "verified": true, "id": 11 }
+    ]
+  },
+  "exception": {
+    "filters": ["uncaught"],
+    "breakpoints": [
+      { "verified": true }
+    ]
+  }
+}
+```
+
+`source` 始终存在，无 source 断点时为 `[]`；`function` 只在存在函数断点时出现；`exception` 只在启动时下发了 exception filter 时出现，Adapter 未返回状态时省略其中的 `breakpoints`。结构与 `start` / `set_breakpoints` / `set_function_breakpoints` 返回的相应字段保持一致。
 
 ### `continue`
 

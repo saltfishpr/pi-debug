@@ -7,7 +7,7 @@ import { resolveVariables } from "../config/variables.js";
 import { finishesWithin, observe } from "./async.js";
 import { DebugError, throwIfAborted } from "./errors.js";
 import { DebugSession } from "./session.js";
-import type { ExecutionOutcome, InitialBreakpoints, InitialBreakpointsResult, StopResult } from "./types.js";
+import type { BreakpointsSnapshot, ExecutionOutcome, InitialBreakpoints, StopResult } from "./types.js";
 
 const START_TIMEOUT_MS = 30_000;
 const CLEANUP_WAIT_MS = 5_000;
@@ -48,7 +48,7 @@ export class DebugSessionManager {
       waitMs: number;
     },
     signal?: AbortSignal,
-  ): Promise<{ execution: ExecutionOutcome; breakpoints: InitialBreakpointsResult }> {
+  ): Promise<{ execution: ExecutionOutcome; breakpoints: BreakpointsSnapshot }> {
     this.assertAvailable();
     throwIfAborted(signal);
     if (this.starting) throw new DebugError("OPERATION_CONFLICT", "A debug session is already starting.");

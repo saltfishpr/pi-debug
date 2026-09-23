@@ -6,7 +6,8 @@ import { finishesWithin, observe } from "./async.js";
 import { DapClient } from "./dap-client.js";
 import { abortError, DebugError, throwIfAborted } from "./errors.js";
 import type {
-  BreakpointsResult,
+  BreakpointsSnapshot,
+  ExceptionBreakpointsResult,
   ExecuteAction,
   ExecuteOptions,
   ExecutionOutcome,
@@ -14,7 +15,6 @@ import type {
   FunctionBreakpointSpec,
   FunctionBreakpointsResult,
   InitialBreakpoints,
-  InitialBreakpointsResult,
   Inspection,
   OutputOptions,
   Page,
@@ -25,6 +25,7 @@ import type {
   SessionState,
   SourceBreakpoints,
   SourceBreakpointSpec,
+  SourceBreakpointsResult,
   StackResult,
   StartOptions,
   StopContext,
@@ -66,6 +67,9 @@ export class DebugSession {
   private readonly changeWaiters = new Set<() => void>();
   private readonly outputEvents: DebugProtocol.OutputEvent["body"][] = [];
   private readonly pendingBreakpointFiles = new Set<string>();
+  private readonly installedSourceBreakpoints = new Map<string, SourceBreakpointsResult>();
+  private installedFunctionBreakpoints: FunctionBreakpointsResult | undefined;
+  private installedExceptionBreakpoints: ExceptionBreakpointsResult | undefined;
   private pendingFunctionBreakpoints = false;
 
   private state: SessionState = { state: "starting" };
@@ -138,7 +142,7 @@ export class DebugSession {
   async start(
     options: StartOptions,
     signal?: AbortSignal,
-  ): Promise<{ execution: ExecutionOutcome; breakpoints: InitialBreakpointsResult }> {
+  ): Promise<{ execution: ExecutionOutcome; breakpoints: BreakpointsSnapshot }> {
     if (this.startCalled || this.state.state !== "starting") {
       throw new DebugError("INVALID_STATE", "Debug session startup has already begun.");
     }
@@ -154,7 +158,7 @@ export class DebugSession {
       ? AbortSignal.any([signal, this.lifetime.signal, deadline.signal])
       : AbortSignal.any([this.lifetime.signal, deadline.signal]);
 
-    let breakpoints: InitialBreakpointsResult;
+    let breakpoints: BreakpointsSnapshot;
     let baseline: number;
     try {
       this.assertWaitMs(options.waitMs);
@@ -251,8 +255,20 @@ export class DebugSession {
     return this.cleanupPromise;
   }
 
+  /** Return a snapshot of every breakpoint currently installed in the session. */
+  listBreakpoints(): BreakpointsSnapshot {
+    const source = [...this.installedSourceBreakpoints.values()]
+      .sort((a, b) => (a.source.path ?? "").localeCompare(b.source.path ?? ""))
+      .map((entry) => structuredClone(entry));
+    return {
+      source,
+      ...(this.installedFunctionBreakpoints ? { function: structuredClone(this.installedFunctionBreakpoints) } : {}),
+      ...(this.installedExceptionBreakpoints ? { exception: structuredClone(this.installedExceptionBreakpoints) } : {}),
+    };
+  }
+
   /** Replace all source breakpoints in one file. */
-  async setBreakpoints(source: SourceBreakpoints, signal?: AbortSignal): Promise<BreakpointsResult> {
+  async setBreakpoints(source: SourceBreakpoints, signal?: AbortSignal): Promise<SourceBreakpointsResult> {
     return this.withOperation(async () => {
       this.assertActive();
       const path = resolve(this.cwd, source.file);
@@ -279,7 +295,7 @@ export class DebugSession {
       void settled.catch(() => undefined);
       const response = await observe(settled, this.operationSignal(signal));
       this.assertActive();
-      return { source: { path }, body: response.body };
+      return this.rememberSourceBreakpoints(path, source.lines, response.body.breakpoints);
     }, signal);
   }
 
@@ -312,7 +328,7 @@ export class DebugSession {
       void settled.catch(() => undefined);
       const response = await observe(settled, this.operationSignal(signal));
       this.assertActive();
-      return { body: response.body };
+      return this.rememberFunctionBreakpoints(specs, response.body.breakpoints);
     }, signal);
   }
 
@@ -519,6 +535,36 @@ export class DebugSession {
     return { ...result, items: result.items.map((event) => structuredClone(event)) };
   }
 
+  private rememberSourceBreakpoints(
+    path: string,
+    specs: SourceBreakpointSpec[],
+    breakpoints: DebugProtocol.Breakpoint[],
+  ): SourceBreakpointsResult {
+    if (!specs.length) {
+      this.installedSourceBreakpoints.delete(path);
+      return { source: { path }, specs: [], breakpoints };
+    }
+    const entry: SourceBreakpointsResult = {
+      source: { path },
+      specs: structuredClone(specs),
+      breakpoints,
+    };
+    this.installedSourceBreakpoints.set(path, entry);
+    return entry;
+  }
+
+  private rememberFunctionBreakpoints(
+    specs: FunctionBreakpointSpec[],
+    breakpoints: DebugProtocol.Breakpoint[],
+  ): FunctionBreakpointsResult {
+    if (!specs.length) {
+      this.installedFunctionBreakpoints = undefined;
+      return { specs: [], breakpoints };
+    }
+    this.installedFunctionBreakpoints = { specs: structuredClone(specs), breakpoints };
+    return this.installedFunctionBreakpoints;
+  }
+
   private toDapBreakpoints(specs: SourceBreakpointSpec[]): DebugProtocol.SourceBreakpoint[] {
     return specs.map((spec) => {
       if (spec.condition !== undefined && this.capabilities.supportsConditionalBreakpoints !== true) {
@@ -559,14 +605,14 @@ export class DebugSession {
     breakpoints: InitialBreakpoints,
     deadlineAt: number,
     signal: AbortSignal,
-  ): Promise<InitialBreakpointsResult> {
+  ): Promise<BreakpointsSnapshot> {
     while (!this.initializedSeen) {
       this.assertStarting();
       throwIfAborted(signal);
       await this.waitForChange(this.startupRemaining(deadlineAt), signal);
     }
 
-    const source: BreakpointsResult[] = [];
+    const source: SourceBreakpointsResult[] = [];
     const seen = new Set<string>();
     for (const entry of breakpoints.source ?? []) {
       const path = resolve(this.cwd, entry.file);
@@ -581,7 +627,7 @@ export class DebugSession {
         signal,
       );
       this.assertStarting();
-      source.push({ source: { path }, body: response.body });
+      source.push(this.rememberSourceBreakpoints(path, entry.lines, response.body.breakpoints));
     }
 
     let functionResult: FunctionBreakpointsResult | undefined;
@@ -596,21 +642,36 @@ export class DebugSession {
         signal,
       );
       this.assertStarting();
-      functionResult = { body: response.body };
+      functionResult = this.rememberFunctionBreakpoints(breakpoints.function, response.body.breakpoints);
     }
 
-    const filters =
-      this.capabilities.exceptionBreakpointFilters?.filter((filter) => filter.default).map((filter) => filter.filter) ??
-      [];
+    let exceptionResult: ExceptionBreakpointsResult | undefined;
     if (this.capabilities.exceptionBreakpointFilters?.length) {
-      await this.call("setExceptionBreakpoints", { filters }, this.startupRequestTimeout(deadlineAt), signal);
+      const filters = this.capabilities.exceptionBreakpointFilters
+        .filter((filter) => filter.default)
+        .map((filter) => filter.filter);
+      const response = await this.call(
+        "setExceptionBreakpoints",
+        { filters },
+        this.startupRequestTimeout(deadlineAt),
+        signal,
+      );
       this.assertStarting();
+      this.installedExceptionBreakpoints = {
+        filters: [...filters],
+        ...(response.body?.breakpoints ? { breakpoints: response.body.breakpoints } : {}),
+      };
+      exceptionResult = this.installedExceptionBreakpoints;
     }
     if (this.capabilities.supportsConfigurationDoneRequest) {
       await this.call("configurationDone", undefined, this.startupRequestTimeout(deadlineAt), signal);
       this.assertStarting();
     }
-    return { source, ...(functionResult ? { function: functionResult } : {}) };
+    return {
+      source,
+      ...(functionResult ? { function: functionResult } : {}),
+      ...(exceptionResult ? { exception: exceptionResult } : {}),
+    };
   }
 
   private startupRemaining(deadlineAt: number): number {
@@ -904,6 +965,31 @@ export class DebugSession {
       case "terminated":
         void this.close({ kind: "terminated" });
         break;
+      case "breakpoint":
+        this.handleBreakpointEvent((event as DebugProtocol.BreakpointEvent).body);
+        break;
+    }
+  }
+
+  private handleBreakpointEvent(body: DebugProtocol.BreakpointEvent["body"]): void {
+    const target = body.breakpoint;
+    if (target.id === undefined) return;
+    const groups: DebugProtocol.Breakpoint[][] = [];
+    for (const entry of this.installedSourceBreakpoints.values()) groups.push(entry.breakpoints);
+    if (this.installedFunctionBreakpoints) groups.push(this.installedFunctionBreakpoints.breakpoints);
+    if (this.installedExceptionBreakpoints?.breakpoints) groups.push(this.installedExceptionBreakpoints.breakpoints);
+
+    for (const list of groups) {
+      const index = list.findIndex((entry) => entry.id === target.id);
+      if (index === -1) continue;
+      if (body.reason === "removed") list.splice(index, 1);
+      else list[index] = target;
+      return;
+    }
+    // A `new` breakpoint without an installed peer is rare (e.g. inline). Add it to the closest source list if possible.
+    if (body.reason === "new" && target.source?.path) {
+      const entry = this.installedSourceBreakpoints.get(target.source.path);
+      if (entry) entry.breakpoints.push(target);
     }
   }
 

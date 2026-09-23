@@ -9,6 +9,7 @@ import {
   formatConfigurationsResult,
   formatEvaluateResult,
   formatExecutionOutcome,
+  formatListBreakpointsResult,
   formatOutputResult,
   formatSessionSnapshot,
   formatSetBreakpointsResult,
@@ -118,6 +119,8 @@ export function registerDebugTool(pi: ExtensionAPI, manager: DebugSessionManager
             const result = await manager.get().setFunctionBreakpoints(args.functionBreakpoints, signal);
             return done(resultText(formatSetFunctionBreakpointsResult(result)));
           }
+          case "list_breakpoints":
+            return done(resultText(formatListBreakpointsResult(manager.get().listBreakpoints())));
           case "threads": {
             const result = await manager.get().threads(pageOptions(args), signal);
             return done(resultText(formatThreadSnapshots(result)));

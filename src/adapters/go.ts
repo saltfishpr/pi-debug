@@ -17,7 +17,7 @@ const goConfigurationSchema = z
     port: z.number().int().min(1).max(65535).optional(),
     debugAdapter: z.literal("dlv-dap").optional(),
     console: z.literal("internalConsole").optional(),
-    stopOnEntry: z.boolean().default(true),
+    stopOnEntry: z.boolean().optional(),
   })
   .loose();
 

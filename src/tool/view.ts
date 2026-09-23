@@ -2,13 +2,13 @@ import type { DebugProtocol } from "@vscode/debugprotocol";
 import type { DebugConfiguration } from "../config/launch-config.js";
 import { DebugError } from "../debug/errors.js";
 import type {
-  BreakpointsResult,
+  BreakpointsSnapshot,
   ExecutionOutcome,
   FunctionBreakpointsResult,
-  InitialBreakpointsResult,
   Inspection,
   Page,
   SessionSnapshot,
+  SourceBreakpointsResult,
   StackResult,
   StopResult,
   ThreadSnapshot,
@@ -47,26 +47,35 @@ export function formatExecutionOutcome(result: ExecutionOutcome) {
   return "snapshot" in result ? { ...result, snapshot: formatSessionSnapshot(result.snapshot) } : result;
 }
 
-export function formatStartResult(result: { execution: ExecutionOutcome; breakpoints: InitialBreakpointsResult }) {
+function formatBreakpointsSnapshot(snapshot: BreakpointsSnapshot) {
+  return {
+    source: snapshot.source,
+    ...(snapshot.function ? { function: snapshot.function } : {}),
+    ...(snapshot.exception ? { exception: snapshot.exception } : {}),
+  };
+}
+
+export function formatSetBreakpointsResult(result: SourceBreakpointsResult) {
+  return { sourceBreakpoints: result };
+}
+
+export function formatSetFunctionBreakpointsResult(result: FunctionBreakpointsResult) {
+  return { functionBreakpoints: result };
+}
+
+export function formatListBreakpointsResult(snapshot: BreakpointsSnapshot) {
+  return formatBreakpointsSnapshot(snapshot);
+}
+
+export function formatStartResult(result: { execution: ExecutionOutcome; breakpoints: BreakpointsSnapshot }) {
   return {
     execution: formatExecutionOutcome(result.execution),
-    breakpoints: {
-      source: result.breakpoints.source.map(({ source, body }) => ({ source, ...body })),
-      ...(result.breakpoints.function ? { function: result.breakpoints.function.body } : {}),
-    },
+    breakpoints: formatBreakpointsSnapshot(result.breakpoints),
   };
 }
 
 export function formatStopResult(result: StopResult) {
   return result.kind === "noSession" ? result : { ...result, snapshot: formatSessionSnapshot(result.snapshot) };
-}
-
-export function formatSetBreakpointsResult(result: BreakpointsResult) {
-  return { sourceBreakpoints: { source: result.source, ...result.body } };
-}
-
-export function formatSetFunctionBreakpointsResult(result: FunctionBreakpointsResult) {
-  return { functionBreakpoints: result.body };
 }
 
 export function formatThreadSnapshots(page: Page<ThreadSnapshot>) {
