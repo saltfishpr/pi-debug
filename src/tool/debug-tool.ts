@@ -28,7 +28,7 @@ export function registerDebugTool(pi: ExtensionAPI, manager: DebugSessionManager
     label: "Debug",
     description: [
       "Manage one program debugging session at a time. Use `configurations` to find saved launch settings, then `start` with a saved name or an inline launch/attach configuration; a new session requires the previous one to be closed.",
-      "In an active session, set breakpoints (source or function), control execution, inspect stopped threads, or evaluate expressions. `status` reports the session state, `wait` observes stops or exits without controlling execution, `output` reads buffered output, and `stop` requests cleanup.",
+      "In an active session, set breakpoints (source or function), control execution, inspect stopped threads, or evaluate expressions. `status` reports the session state and whether another operation is in flight (`busy`), `wait` observes stops or exits without controlling execution, `output` reads buffered output, and `stop` requests cleanup.",
       "Execution controls may return after an observation timeout without stopping the program. `stop` may return while cleanup is still in progress and may terminate a launched program; evaluating expressions can change target state.",
     ].join(" "),
     promptSnippet:

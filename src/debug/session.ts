@@ -125,6 +125,7 @@ export class DebugSession {
       },
       state: structuredClone(this.state),
       revision: this.revision,
+      busy: this.busy || this.pendingExecution,
       threads: [...this.threadsById.values()]
         .filter((thread) => thread.state !== "exited")
         .sort((a, b) => a.id - b.id)

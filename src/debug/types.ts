@@ -48,6 +48,8 @@ export interface SessionSnapshot {
   >;
   state: SessionState;
   revision: number;
+  /** True when another debug operation is in flight; a next call would fail with `OPERATION_CONFLICT`. */
+  busy: boolean;
   threads: ThreadSnapshot[];
   debuggeeExit?: DebuggeeExit;
 }

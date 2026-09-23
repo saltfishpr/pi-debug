@@ -101,7 +101,7 @@ export const parameters = Type.Object({
     ] as const,
     {
       description:
-        "Select an operation: `configurations` finds saved launch settings; `start` creates a session; `status` reports its cached state; `stop` requests cleanup; `set_breakpoints` replaces one file's breakpoints; `set_function_breakpoints` replaces the global function-name breakpoint list. `continue` resumes, `next` steps over, `step_in` enters, `step_out` returns, and `pause` interrupts. `wait` observes without controlling execution; `threads` refreshes the thread list; `stack_trace` lists frames; `variables` reads a scope or expands a value; `evaluate` runs an expression; `output` reads buffered events.",
+        "Select an operation: `configurations` finds saved launch settings; `start` creates a session; `status` returns the current session snapshot, including `busy` when another operation is in flight; `stop` requests cleanup; `set_breakpoints` replaces one file's breakpoints; `set_function_breakpoints` replaces the global function-name breakpoint list. `continue` resumes, `next` steps over, `step_in` enters, `step_out` returns, and `pause` interrupts. `wait` observes without controlling execution; `threads` refreshes the thread list; `stack_trace` lists frames; `variables` reads a scope or expands a value; `evaluate` runs an expression; `output` reads buffered events.",
     },
   ),
   configuration: Type.Optional(
