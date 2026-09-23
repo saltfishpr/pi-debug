@@ -1,15 +1,49 @@
 import { StringEnum, Type } from "@earendil-works/pi-ai";
 
+const sourceBreakpointSpecSchema = Type.Object(
+  {
+    line: Type.Integer({
+      minimum: 1,
+      description: "One-based line in the file where this breakpoint is placed.",
+    }),
+    condition: Type.Optional(
+      Type.String({
+        minLength: 1,
+        description:
+          "Break only when this expression is truthy in the target program's language. Requires adapter support for conditional breakpoints; on unsupported adapters `set_breakpoints` fails.",
+      }),
+    ),
+    hitCondition: Type.Optional(
+      Type.String({
+        minLength: 1,
+        description:
+          "Break based on hit count using adapter syntax such as `>=5` or `%3`. Requires adapter support for hit-count breakpoints; on unsupported adapters `set_breakpoints` fails.",
+      }),
+    ),
+    logMessage: Type.Optional(
+      Type.String({
+        minLength: 1,
+        description:
+          "Emit this message on hit instead of stopping; the adapter interpolates `{expr}` segments. Requires adapter support for log points; on unsupported adapters `set_breakpoints` fails.",
+      }),
+    ),
+  },
+  {
+    additionalProperties: false,
+    description: "One line's breakpoint with optional condition, hit-count, or log-message behavior.",
+  },
+);
+
 const sourceBreakpointsSchema = Type.Object(
   {
     file: Type.String({
       minLength: 1,
       description: "Source path for these breakpoints. Relative paths resolve against the project directory.",
     }),
-    lines: Type.Array(Type.Integer({ minimum: 1 }), {
+    lines: Type.Array(sourceBreakpointSpecSchema, {
       maxItems: 100,
       description:
-        "Line numbers in `file`, starting at 1. This list replaces all breakpoints in that file, not just the changed lines; [] clears them.",
+        "Breakpoints for `file`. This list replaces all breakpoints in that file, not just the changed ones; [] clears them. Each entry keeps its own `condition`, `hitCondition`, and `logMessage`.",
     }),
   },
   {

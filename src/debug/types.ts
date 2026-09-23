@@ -38,7 +38,13 @@ export type StoppedThread = ThreadSnapshot & {
 /** A detached snapshot of locally observed session state. */
 export interface SessionSnapshot {
   configuration: Pick<DebugConfiguration, "name" | "type" | "request">;
-  capabilities: Pick<DebugProtocol.Capabilities, "supportsSingleThreadExecutionRequests">;
+  capabilities: Pick<
+    DebugProtocol.Capabilities,
+    | "supportsSingleThreadExecutionRequests"
+    | "supportsConditionalBreakpoints"
+    | "supportsHitConditionalBreakpoints"
+    | "supportsLogPoints"
+  >;
   state: SessionState;
   revision: number;
   threads: ThreadSnapshot[];
@@ -51,10 +57,21 @@ export type StopResult =
   | { kind: "closing"; snapshot: SessionSnapshot }
   | { kind: "closed"; snapshot: SessionSnapshot };
 
-/** Source breakpoint replacement, with one-based line numbers. */
+/** One breakpoint's position and optional conditions, with a one-based line number. */
+export interface SourceBreakpointSpec {
+  line: number;
+  /** Adapter-evaluated expression; break only when it is truthy. */
+  condition?: string;
+  /** Adapter-evaluated hit-count expression, such as `>=5` or `%3`. */
+  hitCondition?: string;
+  /** Adapter-interpolated message emitted on hit; the debuggee does not stop. */
+  logMessage?: string;
+}
+
+/** Source breakpoint replacement: `lines` fully replaces the file's breakpoints. */
 export interface SourceBreakpoints {
   file: string;
-  lines: number[];
+  lines: SourceBreakpointSpec[];
 }
 
 export interface StartOptions {

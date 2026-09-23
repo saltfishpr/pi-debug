@@ -20,6 +20,7 @@ import type {
   SessionSnapshot,
   SessionState,
   SourceBreakpoints,
+  SourceBreakpointSpec,
   StackResult,
   StartOptions,
   StopContext,
@@ -112,6 +113,9 @@ export class DebugSession {
       },
       capabilities: {
         supportsSingleThreadExecutionRequests: this.capabilities.supportsSingleThreadExecutionRequests === true,
+        supportsConditionalBreakpoints: this.capabilities.supportsConditionalBreakpoints === true,
+        supportsHitConditionalBreakpoints: this.capabilities.supportsHitConditionalBreakpoints === true,
+        supportsLogPoints: this.capabilities.supportsLogPoints === true,
       },
       state: structuredClone(this.state),
       revision: this.revision,
@@ -248,9 +252,10 @@ export class DebugSession {
       if (this.pendingBreakpointFiles.has(path)) {
         throw new DebugError("OPERATION_CONFLICT", `A breakpoint update for '${path}' is still pending.`);
       }
+      const breakpoints = this.toDapBreakpoints(source.lines);
       const request = this.client.request(
         "setBreakpoints",
-        { source: { path }, breakpoints: source.lines.map((line) => ({ line })) },
+        { source: { path }, breakpoints },
         { timeoutMs: REQUEST_TIMEOUT_MS },
       );
       this.pendingBreakpointFiles.add(path);
@@ -474,6 +479,26 @@ export class DebugSession {
     return { ...result, items: result.items.map((event) => structuredClone(event)) };
   }
 
+  private toDapBreakpoints(specs: SourceBreakpointSpec[]): DebugProtocol.SourceBreakpoint[] {
+    return specs.map((spec) => {
+      if (spec.condition !== undefined && this.capabilities.supportsConditionalBreakpoints !== true) {
+        throw new DebugError("INVALID_ARGUMENT", "This adapter does not support conditional breakpoints.");
+      }
+      if (spec.hitCondition !== undefined && this.capabilities.supportsHitConditionalBreakpoints !== true) {
+        throw new DebugError("INVALID_ARGUMENT", "This adapter does not support hit-count conditional breakpoints.");
+      }
+      if (spec.logMessage !== undefined && this.capabilities.supportsLogPoints !== true) {
+        throw new DebugError("INVALID_ARGUMENT", "This adapter does not support log points.");
+      }
+      return {
+        line: spec.line,
+        ...(spec.condition !== undefined ? { condition: spec.condition } : {}),
+        ...(spec.hitCondition !== undefined ? { hitCondition: spec.hitCondition } : {}),
+        ...(spec.logMessage !== undefined ? { logMessage: spec.logMessage } : {}),
+      };
+    });
+  }
+
   private async configure(
     breakpoints: SourceBreakpoints[],
     deadlineAt: number,
@@ -495,7 +520,7 @@ export class DebugSession {
       seen.add(path);
       const response = await this.call(
         "setBreakpoints",
-        { source: { path }, breakpoints: source.lines.map((line) => ({ line })) },
+        { source: { path }, breakpoints: this.toDapBreakpoints(source.lines) },
         this.startupRequestTimeout(deadlineAt),
         signal,
       );
