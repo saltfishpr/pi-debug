@@ -93,12 +93,33 @@
 {
   "action": "start",
   "configuration": "Launch API", // 必填；也可以是下面的 inline object
-  "initialBreakpoints": [        // 可选，默认 []，最多 100 个 source
-    { "file": "main.go", "lines": [10, 18] } // line 从 1 开始，每个 source 最多 100 行
-  ],
+  "initialBreakpoints": {        // 可选，默认 {}
+    "source": [                  // 可选，每个 file 最多出现一次，最多 100 项
+      {
+        "file": "main.go",       // 相对路径解析到项目目录
+        "lines": [               // 最多 100 项；[] 清空该文件断点
+          { "line": 10 },
+          { "line": 42, "condition": "n > 5" },
+          { "line": 77, "logMessage": "reached with x={x}" }
+        ]
+      }
+    ],
+    "function": [                // 可选，全局函数断点；[] 清空。需要 supportsFunctionBreakpoints
+      { "name": "handleRequest" },
+      { "name": "retry", "hitCondition": ">=3" }
+    ]
+  },
   "waitMs": 5000
 }
 ```
+
+断点条目的通用字段：
+
+- `condition`：条件表达式，仅在为真时中断。需要 `supportsConditionalBreakpoints`。
+- `hitCondition`：命中次数表达式，例如 `>=5` 或 `%3`，由 Adapter 解释。需要 `supportsHitConditionalBreakpoints`。
+- `logMessage`：命中时输出插值消息而不中断（仅 source 断点）。需要 `supportsLogPoints`。
+
+缺少对应 capability 时下发相关字段会直接失败并返回 `INVALID_ARGUMENT`。可在 `status` 中查看 `capabilities`。
 
 Inline 配置保留 Adapter 专属字段：
 
@@ -130,16 +151,25 @@ Inline 配置保留 Adapter 专属字段：
       "stop": { "reason": "breakpoint", "allThreadsStopped": true }
     }
   },
-  "breakpoints": [
-    {
-      "source": { "path": "/workspace/main.go" },
+  "breakpoints": {
+    "source": [
+      {
+        "source": { "path": "/workspace/main.go" },
+        "breakpoints": [
+          { "verified": true, "source": { "path": "/workspace/main.go" }, "line": 10 }
+        ]
+      }
+    ],
+    "function": {
       "breakpoints": [
-        { "verified": true, "source": { "path": "/workspace/main.go" }, "line": 10 }
+        { "verified": true, "id": 3 }
       ]
     }
-  ]
+  }
 }
 ```
+
+`breakpoints.source` 始终存在，未安装任何 source 断点时为 `[]`；`breakpoints.function` 只在入参提供了 `initialBreakpoints.function` 时出现，内容为 DAP `SetFunctionBreakpointsResponse.body`。
 
 ### `status`
 
@@ -157,7 +187,13 @@ Inline 配置保留 Adapter 专属字段：
 {
   "state": { "state": "active" },
   "configuration": { "name": "Launch API", "type": "go", "request": "launch" },
-  "capabilities": { "supportsSingleThreadExecutionRequests": true },
+  "capabilities": {
+    "supportsSingleThreadExecutionRequests": true,
+    "supportsConditionalBreakpoints": true,
+    "supportsHitConditionalBreakpoints": true,
+    "supportsLogPoints": false,
+    "supportsFunctionBreakpoints": true
+  },
   "revision": 12,
   "threads": [
     {
@@ -180,6 +216,8 @@ Inline 配置保留 Adapter 专属字段：
 { "state": "closed", "reason": { "kind": "terminated" }, "cleanupError": "可选清理错误" }
 ```
 
+`capabilities` 是从 Adapter 汇报中挑选出的、影响下发参数选择的开关：`supportsSingleThreadExecutionRequests` 控制 `continue` / 单步的 `singleThread`；`supportsConditionalBreakpoints` / `supportsHitConditionalBreakpoints` / `supportsLogPoints` 控制断点条目上的 `condition` / `hitCondition` / `logMessage`；`supportsFunctionBreakpoints` 控制 `set_function_breakpoints` 与 `initialBreakpoints.function`。未汇报的能力统一表示为 `false`。
+
 ### `stop`
 
 请求关闭当前 session，等待资源清理完成，并从 manager 中移除 session。重复停止一个已经被移除或启动中止的 session 返回 `noSession`。
@@ -198,7 +236,13 @@ Inline 配置保留 Adapter 专属字段：
   "snapshot": {
     "state": { "state": "closed", "reason": { "kind": "requested" } },
     "configuration": { "name": "Launch API", "type": "go", "request": "launch" },
-    "capabilities": { "supportsSingleThreadExecutionRequests": true },
+    "capabilities": {
+      "supportsSingleThreadExecutionRequests": true,
+      "supportsConditionalBreakpoints": true,
+      "supportsHitConditionalBreakpoints": true,
+      "supportsLogPoints": false,
+      "supportsFunctionBreakpoints": true
+    },
     "revision": 15,
     "threads": []
   }
@@ -213,7 +257,7 @@ Inline 配置保留 Adapter 专属字段：
 
 ### `set_breakpoints`
 
-替换一个 source 文件的全部断点，不是在原有断点后追加。传空 `lines` 会清除该文件断点。
+替换一个 source 文件的全部断点，不是在原有断点后追加。传空 `lines` 会清除该文件断点。每条断点可独立携带 `condition` / `hitCondition` / `logMessage`；缺少对应 capability 时直接返回 `INVALID_ARGUMENT`。
 
 **入参**
 
@@ -221,12 +265,18 @@ Inline 配置保留 Adapter 专属字段：
 {
   "action": "set_breakpoints",
   "breakpoints": {
-    { "file": "main.go", "lines": [10, 18] } // line 从 1 开始，每个 source 最多 100 行
+    "file": "main.go",
+    "lines": [
+      { "line": 10 },
+      { "line": 42, "condition": "n > 5" },
+      { "line": 55, "hitCondition": ">=3" },
+      { "line": 77, "logMessage": "reached with x={x}" }
+    ]
   }
 }
 ```
 
-`file` 必填，可为绝对路径或项目目录的相对路径；`lines` 必填、从 1 开始，最多 100 项。
+`file` 必填，可为绝对路径或项目目录的相对路径；`lines` 必填，最多 100 项。每项 `line` 必填、从 1 开始，其它三个字段可选。
 
 **结果示例**
 
@@ -246,6 +296,40 @@ Inline 配置保留 Adapter 专属字段：
   }
 }
 ```
+
+### `set_function_breakpoints`
+
+替换全局函数断点列表。列表是整体替换，不按调用叠加；传 `[]` 会清空所有函数断点。需要 Adapter 汇报 `supportsFunctionBreakpoints`；`condition` / `hitCondition` 的能力要求与 `set_breakpoints` 一致。
+
+**入参**
+
+```json
+{
+  "action": "set_function_breakpoints",
+  "functionBreakpoints": [
+    { "name": "main" },
+    { "name": "handleRequest", "condition": "req.method == 'POST'" },
+    { "name": "retry", "hitCondition": ">=3" }
+  ]
+}
+```
+
+`functionBreakpoints` 必填，最多 100 项。`name` 的匹配语义由 Adapter 决定（可能接受重载、限定或 mangled 名）。
+
+**结果示例**
+
+```json
+{
+  "functionBreakpoints": {
+    "breakpoints": [
+      { "verified": true, "id": 11 },
+      { "verified": false, "message": "No function matched 'retry'." }
+    ]
+  }
+}
+```
+
+返回的 `breakpoints` 数组与入参一一对应，字段来自 DAP `SetFunctionBreakpointsResponse.body`。
 
 ### `continue`
 

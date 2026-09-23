@@ -49,7 +49,34 @@ const sourceBreakpointsSchema = Type.Object(
   {
     additionalProperties: false,
     description:
-      "One file's complete breakpoint set: pass as `breakpoints` to `set_breakpoints`, or as an entry in `initialBreakpoints` to `start`.",
+      "One file's complete breakpoint set: pass as `breakpoints` to `set_breakpoints`, or as an entry in `initialBreakpoints.source` to `start`.",
+  },
+);
+
+const functionBreakpointSpecSchema = Type.Object(
+  {
+    name: Type.String({
+      minLength: 1,
+      description: "Function name to break on. Matching is adapter-defined and may accept mangled or qualified names.",
+    }),
+    condition: Type.Optional(
+      Type.String({
+        minLength: 1,
+        description:
+          "Break only when this expression is truthy in the target program's language. Requires adapter support for conditional breakpoints; on unsupported adapters `set_function_breakpoints` fails.",
+      }),
+    ),
+    hitCondition: Type.Optional(
+      Type.String({
+        minLength: 1,
+        description:
+          "Break based on hit count using adapter syntax such as `>=5` or `%3`. Requires adapter support for hit-count breakpoints; on unsupported adapters `set_function_breakpoints` fails.",
+      }),
+    ),
+  },
+  {
+    additionalProperties: false,
+    description: "One function-name breakpoint with optional condition or hit-count behavior.",
   },
 );
 
@@ -62,6 +89,7 @@ export const parameters = Type.Object(
         "status",
         "stop",
         "set_breakpoints",
+        "set_function_breakpoints",
         "continue",
         "next",
         "step_in",
@@ -76,7 +104,7 @@ export const parameters = Type.Object(
       ] as const,
       {
         description:
-          "Select an operation: `configurations` finds saved launch settings; `start` creates a session; `status` reports its cached state; `stop` requests cleanup; `set_breakpoints` replaces one file's breakpoints. `continue` resumes, `next` steps over, `step_in` enters, `step_out` returns, and `pause` interrupts. `wait` observes without controlling execution; `threads` refreshes the thread list; `stack_trace` lists frames; `variables` reads a scope or expands a value; `evaluate` runs an expression; `output` reads buffered events.",
+          "Select an operation: `configurations` finds saved launch settings; `start` creates a session; `status` reports its cached state; `stop` requests cleanup; `set_breakpoints` replaces one file's breakpoints; `set_function_breakpoints` replaces the global function-name breakpoint list. `continue` resumes, `next` steps over, `step_in` enters, `step_out` returns, and `pause` interrupts. `wait` observes without controlling execution; `threads` refreshes the thread list; `stack_trace` lists frames; `variables` reads a scope or expands a value; `evaluate` runs an expression; `output` reads buffered events.",
       },
     ),
     configuration: Type.Optional(
@@ -112,13 +140,38 @@ export const parameters = Type.Object(
       ),
     ),
     initialBreakpoints: Type.Optional(
-      Type.Array(sourceBreakpointsSchema, {
-        maxItems: 100,
-        description:
-          "For `start`, install these breakpoints during session setup, before observing execution. Omit for no initial breakpoints; include each resolved source file at most once.",
-      }),
+      Type.Object(
+        {
+          source: Type.Optional(
+            Type.Array(sourceBreakpointsSchema, {
+              maxItems: 100,
+              description:
+                "Per-file source breakpoints to install during startup; include each resolved source path at most once. Omit or use [] to install no source breakpoints.",
+            }),
+          ),
+          function: Type.Optional(
+            Type.Array(functionBreakpointSpecSchema, {
+              maxItems: 100,
+              description:
+                "Function-name breakpoints to install during startup; the list is global. Requires adapter capability `supportsFunctionBreakpoints`; omit if the adapter does not support it.",
+            }),
+          ),
+        },
+        {
+          additionalProperties: false,
+          description:
+            "For `start`, install these breakpoints during session setup, before observing execution. Omit both fields (or the whole object) for no initial breakpoints.",
+        },
+      ),
     ),
     breakpoints: Type.Optional(sourceBreakpointsSchema),
+    functionBreakpoints: Type.Optional(
+      Type.Array(functionBreakpointSpecSchema, {
+        maxItems: 100,
+        description:
+          "For `set_function_breakpoints`, replace the entire function-breakpoint list; [] clears them. Requires adapter capability `supportsFunctionBreakpoints`; check `status` first.",
+      }),
+    ),
     threadId: Type.Optional(
       Type.Integer({
         minimum: 1,

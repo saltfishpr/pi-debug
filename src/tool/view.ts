@@ -4,6 +4,8 @@ import { DebugError } from "../debug/errors.js";
 import type {
   BreakpointsResult,
   ExecutionOutcome,
+  FunctionBreakpointsResult,
+  InitialBreakpointsResult,
   Inspection,
   Page,
   SessionSnapshot,
@@ -12,6 +14,12 @@ import type {
   ThreadSnapshot,
   VariablesResult,
 } from "../debug/types.js";
+
+export function formatConfigurationsResult(configurations: DebugConfiguration[]) {
+  return {
+    configurations: configurations.map(({ name, type, request }) => ({ name, type, request })),
+  };
+}
 
 export function formatSessionSnapshot(snapshot: SessionSnapshot): SessionSnapshot {
   return {
@@ -26,16 +34,13 @@ export function formatExecutionOutcome(result: ExecutionOutcome): ExecutionOutco
   return "status" in result ? { ...result, status: formatSessionSnapshot(result.status) } : result;
 }
 
-export function formatConfigurationsResult(configurations: DebugConfiguration[]) {
-  return {
-    configurations: configurations.map(({ name, type, request }) => ({ name, type, request })),
-  };
-}
-
-export function formatStartResult(result: { execution: ExecutionOutcome; breakpoints: BreakpointsResult[] }) {
+export function formatStartResult(result: { execution: ExecutionOutcome; breakpoints: InitialBreakpointsResult }) {
   return {
     execution: formatExecutionOutcome(result.execution),
-    breakpoints: result.breakpoints.map(({ source, body }) => ({ source, ...body })),
+    breakpoints: {
+      source: result.breakpoints.source.map(({ source, body }) => ({ source, ...body })),
+      ...(result.breakpoints.function ? { function: result.breakpoints.function.body } : {}),
+    },
   };
 }
 
@@ -45,6 +50,10 @@ export function formatStopResult(result: StopResult) {
 
 export function formatSetBreakpointsResult(result: BreakpointsResult) {
   return { sourceBreakpoints: { source: result.source, ...result.body } };
+}
+
+export function formatSetFunctionBreakpointsResult(result: FunctionBreakpointsResult) {
+  return { functionBreakpoints: result.body };
 }
 
 export function formatThreadSnapshots(page: Page<ThreadSnapshot>) {

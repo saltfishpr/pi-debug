@@ -7,7 +7,7 @@ import { resolveVariables } from "../config/variables.js";
 import { finishesWithin, observe } from "./async.js";
 import { DebugError, throwIfAborted } from "./errors.js";
 import { DebugSession } from "./session.js";
-import type { BreakpointsResult, ExecutionOutcome, SourceBreakpoints, StopResult } from "./types.js";
+import type { ExecutionOutcome, InitialBreakpoints, InitialBreakpointsResult, StopResult } from "./types.js";
 
 const START_TIMEOUT_MS = 30_000;
 const CLEANUP_WAIT_MS = 5_000;
@@ -15,12 +15,6 @@ const CLEANUP_WAIT_MS = 5_000;
 interface PendingStart {
   abort: AbortController;
   done: Promise<void>;
-}
-
-interface ManagerStartOptions {
-  configuration: string | DebugConfiguration;
-  breakpoints: SourceBreakpoints[];
-  waitMs: number;
 }
 
 /** Own the one debug session associated with this Pi extension session. */
@@ -48,9 +42,13 @@ export class DebugSessionManager {
   /** Resolve a configuration and start a new session within one setup deadline. */
   async start(
     cwd: string,
-    options: ManagerStartOptions,
+    options: {
+      configuration: string | DebugConfiguration;
+      breakpoints: InitialBreakpoints;
+      waitMs: number;
+    },
     signal?: AbortSignal,
-  ): Promise<{ execution: ExecutionOutcome; breakpoints: BreakpointsResult[] }> {
+  ): Promise<{ execution: ExecutionOutcome; breakpoints: InitialBreakpointsResult }> {
     this.assertAvailable();
     throwIfAborted(signal);
     if (this.starting) throw new DebugError("OPERATION_CONFLICT", "A debug session is already starting.");

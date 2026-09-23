@@ -12,6 +12,7 @@ import {
   formatOutputResult,
   formatSessionSnapshot,
   formatSetBreakpointsResult,
+  formatSetFunctionBreakpointsResult,
   formatStackTraceResult,
   formatStartResult,
   formatStopResult,
@@ -27,7 +28,7 @@ export function registerDebugTool(pi: ExtensionAPI, manager: DebugSessionManager
     label: "Debug",
     description: [
       "Manage one program debugging session at a time. Use `configurations` to find saved launch settings, then `start` with a saved name or an inline launch/attach configuration; a new session requires the previous one to be closed.",
-      "In an active session, set breakpoints, control execution, inspect stopped threads, or evaluate expressions. `status` reports the session state, `wait` observes stops or exits without controlling execution, `output` reads buffered output, and `stop` requests cleanup.",
+      "In an active session, set breakpoints (source or function), control execution, inspect stopped threads, or evaluate expressions. `status` reports the session state, `wait` observes stops or exits without controlling execution, `output` reads buffered output, and `stop` requests cleanup.",
       "Execution controls may return after an observation timeout without stopping the program. `stop` may return while cleanup is still in progress and may terminate a launched program; evaluating expressions can change target state.",
     ].join(" "),
     promptSnippet:
@@ -62,7 +63,7 @@ export function registerDebugTool(pi: ExtensionAPI, manager: DebugSessionManager
               ctx.cwd,
               {
                 configuration: args.configuration,
-                breakpoints: args.initialBreakpoints ?? [],
+                breakpoints: args.initialBreakpoints ?? {},
                 waitMs: args.waitMs ?? 1_000,
               },
               signal,
@@ -106,6 +107,16 @@ export function registerDebugTool(pi: ExtensionAPI, manager: DebugSessionManager
             }
             const result = await manager.get().setBreakpoints(args.breakpoints, signal);
             return done(resultText(formatSetBreakpointsResult(result)));
+          }
+          case "set_function_breakpoints": {
+            if (args.functionBreakpoints === undefined) {
+              throw new DebugError(
+                "INVALID_ARGUMENT",
+                "`set_function_breakpoints` requires `functionBreakpoints`; pass [] to clear.",
+              );
+            }
+            const result = await manager.get().setFunctionBreakpoints(args.functionBreakpoints, signal);
+            return done(resultText(formatSetFunctionBreakpointsResult(result)));
           }
           case "threads": {
             const result = await manager.get().threads(pageOptions(args), signal);

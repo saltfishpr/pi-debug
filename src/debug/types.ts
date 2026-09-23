@@ -44,6 +44,7 @@ export interface SessionSnapshot {
     | "supportsConditionalBreakpoints"
     | "supportsHitConditionalBreakpoints"
     | "supportsLogPoints"
+    | "supportsFunctionBreakpoints"
   >;
   state: SessionState;
   revision: number;
@@ -74,8 +75,23 @@ export interface SourceBreakpoints {
   lines: SourceBreakpointSpec[];
 }
 
+/** One function breakpoint entry addressed by function name. */
+export interface FunctionBreakpointSpec {
+  name: string;
+  /** Adapter-evaluated expression; break only when it is truthy. */
+  condition?: string;
+  /** Adapter-evaluated hit-count expression, such as `>=5` or `%3`. */
+  hitCondition?: string;
+}
+
+/** Initial breakpoints installed during session startup, before observing execution. */
+export interface InitialBreakpoints {
+  source?: SourceBreakpoints[];
+  function?: FunctionBreakpointSpec[];
+}
+
 export interface StartOptions {
-  breakpoints: SourceBreakpoints[];
+  breakpoints: InitialBreakpoints;
   waitMs: number;
   /** Absolute deadline shared with configuration and adapter creation. */
   deadline: number;
@@ -85,6 +101,17 @@ export interface StartOptions {
 export interface BreakpointsResult {
   source: DebugProtocol.Source;
   body: DebugProtocol.SetBreakpointsResponse["body"];
+}
+
+/** Original response body for a function-breakpoint replacement. */
+export interface FunctionBreakpointsResult {
+  body: DebugProtocol.SetFunctionBreakpointsResponse["body"];
+}
+
+/** Source and function breakpoints installed during startup, with each original DAP response. */
+export interface InitialBreakpointsResult {
+  source: BreakpointsResult[];
+  function?: FunctionBreakpointsResult;
 }
 
 /** Select a thread and optionally require its current stop revision. */

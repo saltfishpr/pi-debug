@@ -11,6 +11,10 @@ import type {
   ExecuteOptions,
   ExecutionOutcome,
   FrameSelection,
+  FunctionBreakpointSpec,
+  FunctionBreakpointsResult,
+  InitialBreakpoints,
+  InitialBreakpointsResult,
   Inspection,
   OutputOptions,
   Page,
@@ -62,6 +66,7 @@ export class DebugSession {
   private readonly changeWaiters = new Set<() => void>();
   private readonly outputEvents: DebugProtocol.OutputEvent["body"][] = [];
   private readonly pendingBreakpointFiles = new Set<string>();
+  private pendingFunctionBreakpoints = false;
 
   private state: SessionState = { state: "starting" };
   private capabilities: DebugProtocol.Capabilities = {};
@@ -116,6 +121,7 @@ export class DebugSession {
         supportsConditionalBreakpoints: this.capabilities.supportsConditionalBreakpoints === true,
         supportsHitConditionalBreakpoints: this.capabilities.supportsHitConditionalBreakpoints === true,
         supportsLogPoints: this.capabilities.supportsLogPoints === true,
+        supportsFunctionBreakpoints: this.capabilities.supportsFunctionBreakpoints === true,
       },
       state: structuredClone(this.state),
       revision: this.revision,
@@ -131,7 +137,7 @@ export class DebugSession {
   async start(
     options: StartOptions,
     signal?: AbortSignal,
-  ): Promise<{ execution: ExecutionOutcome; breakpoints: BreakpointsResult[] }> {
+  ): Promise<{ execution: ExecutionOutcome; breakpoints: InitialBreakpointsResult }> {
     if (this.startCalled || this.state.state !== "starting") {
       throw new DebugError("INVALID_STATE", "Debug session startup has already begun.");
     }
@@ -147,7 +153,7 @@ export class DebugSession {
       ? AbortSignal.any([signal, this.lifetime.signal, deadline.signal])
       : AbortSignal.any([this.lifetime.signal, deadline.signal]);
 
-    let breakpoints: BreakpointsResult[];
+    let breakpoints: InitialBreakpointsResult;
     let baseline: number;
     try {
       this.assertWaitMs(options.waitMs);
@@ -273,6 +279,39 @@ export class DebugSession {
       const response = await observe(settled, this.operationSignal(signal));
       this.assertActive();
       return { source: { path }, body: response.body };
+    }, signal);
+  }
+
+  /** Replace all function breakpoints; the list is global, not per-source. */
+  async setFunctionBreakpoints(
+    specs: FunctionBreakpointSpec[],
+    signal?: AbortSignal,
+  ): Promise<FunctionBreakpointsResult> {
+    return this.withOperation(async () => {
+      this.assertActive();
+      if (this.capabilities.supportsFunctionBreakpoints !== true) {
+        throw new DebugError("INVALID_ARGUMENT", "This adapter does not support function breakpoints.");
+      }
+      if (this.pendingFunctionBreakpoints) {
+        throw new DebugError("OPERATION_CONFLICT", "A function-breakpoint update is still pending.");
+      }
+      const breakpoints = this.toDapFunctionBreakpoints(specs);
+      this.pendingFunctionBreakpoints = true;
+      const request = this.client.request("setFunctionBreakpoints", { breakpoints }, { timeoutMs: REQUEST_TIMEOUT_MS });
+      const settled = request.then(
+        (response) => {
+          this.pendingFunctionBreakpoints = false;
+          return response;
+        },
+        (error: unknown) => {
+          this.pendingFunctionBreakpoints = false;
+          throw error;
+        },
+      );
+      void settled.catch(() => undefined);
+      const response = await observe(settled, this.operationSignal(signal));
+      this.assertActive();
+      return { body: response.body };
     }, signal);
   }
 
@@ -499,33 +538,64 @@ export class DebugSession {
     });
   }
 
+  private toDapFunctionBreakpoints(specs: FunctionBreakpointSpec[]): DebugProtocol.FunctionBreakpoint[] {
+    return specs.map((spec) => {
+      if (spec.condition !== undefined && this.capabilities.supportsConditionalBreakpoints !== true) {
+        throw new DebugError("INVALID_ARGUMENT", "This adapter does not support conditional breakpoints.");
+      }
+      if (spec.hitCondition !== undefined && this.capabilities.supportsHitConditionalBreakpoints !== true) {
+        throw new DebugError("INVALID_ARGUMENT", "This adapter does not support hit-count conditional breakpoints.");
+      }
+      return {
+        name: spec.name,
+        ...(spec.condition !== undefined ? { condition: spec.condition } : {}),
+        ...(spec.hitCondition !== undefined ? { hitCondition: spec.hitCondition } : {}),
+      };
+    });
+  }
+
   private async configure(
-    breakpoints: SourceBreakpoints[],
+    breakpoints: InitialBreakpoints,
     deadlineAt: number,
     signal: AbortSignal,
-  ): Promise<BreakpointsResult[]> {
+  ): Promise<InitialBreakpointsResult> {
     while (!this.initializedSeen) {
       this.assertStarting();
       throwIfAborted(signal);
       await this.waitForChange(this.startupRemaining(deadlineAt), signal);
     }
 
+    const source: BreakpointsResult[] = [];
     const seen = new Set<string>();
-    const results: BreakpointsResult[] = [];
-    for (const source of breakpoints) {
-      const path = resolve(this.cwd, source.file);
+    for (const entry of breakpoints.source ?? []) {
+      const path = resolve(this.cwd, entry.file);
       if (seen.has(path)) {
         throw new DebugError("INVALID_ARGUMENT", `Initial breakpoints repeat source '${path}'.`);
       }
       seen.add(path);
       const response = await this.call(
         "setBreakpoints",
-        { source: { path }, breakpoints: this.toDapBreakpoints(source.lines) },
+        { source: { path }, breakpoints: this.toDapBreakpoints(entry.lines) },
         this.startupRequestTimeout(deadlineAt),
         signal,
       );
       this.assertStarting();
-      results.push({ source: { path }, body: response.body });
+      source.push({ source: { path }, body: response.body });
+    }
+
+    let functionResult: FunctionBreakpointsResult | undefined;
+    if (breakpoints.function !== undefined) {
+      if (this.capabilities.supportsFunctionBreakpoints !== true) {
+        throw new DebugError("INVALID_ARGUMENT", "This adapter does not support function breakpoints.");
+      }
+      const response = await this.call(
+        "setFunctionBreakpoints",
+        { breakpoints: this.toDapFunctionBreakpoints(breakpoints.function) },
+        this.startupRequestTimeout(deadlineAt),
+        signal,
+      );
+      this.assertStarting();
+      functionResult = { body: response.body };
     }
 
     const filters =
@@ -539,7 +609,7 @@ export class DebugSession {
       await this.call("configurationDone", undefined, this.startupRequestTimeout(deadlineAt), signal);
       this.assertStarting();
     }
-    return results;
+    return { source, ...(functionResult ? { function: functionResult } : {}) };
   }
 
   private startupRemaining(deadlineAt: number): number {
