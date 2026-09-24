@@ -1,6 +1,6 @@
-import { createServer } from "node:net";
 import { resolve } from "node:path";
 import { z } from "zod";
+import { pickFreePort } from "../common/port.js";
 import { SocketDebugAdapter, SpawnedServerDebugAdapter } from "../dap";
 import type { DebugAdapterProvider } from "./index.js";
 
@@ -16,8 +16,6 @@ const goConfigurationSchema = z
     host: z.string().min(1).default("127.0.0.1"),
     port: z.number().int().min(1).max(65535).optional(),
     debugAdapter: z.literal("dlv-dap").optional(),
-    console: z.literal("internalConsole").optional(),
-    stopOnEntry: z.boolean().optional(),
   })
   .loose();
 
@@ -66,17 +64,4 @@ function isGoLaunchMode(mode: string): boolean {
 
 function isGoAttachMode(mode: string): boolean {
   return mode === "local" || mode === "remote";
-}
-
-/** Find an available port for the Delve server before it starts. */
-async function pickFreePort(): Promise<number> {
-  const server = createServer();
-  await new Promise<void>((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", resolve);
-  });
-  const address = server.address();
-  await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
-  if (!address || typeof address === "string") throw new Error("Failed to allocate a Delve DAP port.");
-  return address.port;
 }

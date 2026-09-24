@@ -678,6 +678,8 @@ Inline 配置保留 Adapter 专属字段：
 
 读取内存中的 debuggee output event。buffer 最多保留最近 1000 个 event。可按 DAP category 精确过滤，例如 `stdout`、`stderr`、`console`、`important` 或 `telemetry`。`start` 在过滤后应用。
 
+adapter 通过 DAP `runInTerminal` 启动的 integrated terminal 输出也进入该 buffer，category 固定为 `console`。PTY 会合并 stdout 和 stderr；当前不支持向 terminal 输入，也不支持 external terminal 或 shell 参数解释。
+
 **入参**
 
 ```json

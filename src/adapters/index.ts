@@ -2,8 +2,8 @@
 import type { DebugConfiguration } from "../config/launch-config.js";
 import type { DebugAdapter } from "../dap";
 import { goProvider } from "./go.js";
+import { nodeProvider } from "./node.js";
 import { pythonProvider } from "./python.js";
-export { goProvider, pythonProvider };
 
 /** A transport and the normalized configuration to send when starting it. */
 export interface ResolvedDebugAdapter {
@@ -20,7 +20,11 @@ export interface DebugAdapterProvider {
 
 /** Return the provider for a supported launch.json type, or reject unsupported debuggers. */
 export function getDebugAdapterProvider(type: string): DebugAdapterProvider {
-  const provider = [goProvider].find((provider) => provider.types.includes(type));
-  if (!provider) throw new Error(`Unsupported debug adapter type '${type}'. Supported types: go.`);
+  const providers = [goProvider, pythonProvider, nodeProvider];
+  const provider = providers.find((provider) => provider.types.includes(type));
+  if (!provider) {
+    const supported = providers.flatMap((provider) => provider.types).join(", ");
+    throw new Error(`Unsupported debug adapter type '${type}'. Supported types: ${supported}.`);
+  }
   return provider;
 }

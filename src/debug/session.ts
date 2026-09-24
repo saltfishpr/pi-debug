@@ -5,6 +5,7 @@ import type { DapRequestMap, DebugAdapter } from "../dap/index.js";
 import { finishesWithin, observe } from "./async.js";
 import { DapClient } from "./dap-client.js";
 import { abortError, DebugError, throwIfAborted } from "./errors.js";
+import { IntegratedTerminalHost } from "./integrated-terminal.js";
 import type {
   BreakpointsSnapshot,
   EvaluateOutcome,
@@ -64,6 +65,7 @@ interface StopEventRecord {
 export class DebugSession {
   private readonly client: DapClient;
   private readonly lifetime = new AbortController();
+  private readonly terminals: IntegratedTerminalHost;
   private readonly threadsById = new Map<number, ThreadRecord>();
   private readonly changeWaiters = new Set<() => void>();
   private readonly outputEvents: DebugProtocol.OutputEvent["body"][] = [];
@@ -97,6 +99,10 @@ export class DebugSession {
     private readonly cwd: string,
   ) {
     this.client = new DapClient(adapter);
+    this.terminals = new IntegratedTerminalHost({
+      workspaceFolder: cwd,
+      onOutput: (output) => this.appendOutput({ category: "console", output }),
+    });
     adapter.onEvent((event) => {
       try {
         this.handleEvent(event);
@@ -187,10 +193,11 @@ export class DebugSession {
           pathFormat: "path",
           supportsVariableType: true,
           supportsVariablePaging: true,
-          supportsRunInTerminalRequest: false,
+          supportsRunInTerminalRequest: true,
           supportsProgressReporting: false,
           supportsInvalidatedEvent: true,
           supportsMemoryEvent: false,
+          supportsArgsCanBeInterpretedByShell: false,
           supportsStartDebuggingRequest: false,
         },
         this.startupRequestTimeout(options.deadline),
@@ -942,8 +949,7 @@ export class DebugSession {
         };
         break;
       case "output":
-        this.outputEvents.push((event as DebugProtocol.OutputEvent).body);
-        if (this.outputEvents.length > 1000) this.outputEvents.shift();
+        this.appendOutput((event as DebugProtocol.OutputEvent).body);
         break;
       case "stopped":
         this.handleStopped((event as DebugProtocol.StoppedEvent).body);
@@ -1098,6 +1104,11 @@ export class DebugSession {
         }
       }
       try {
+        await this.terminals.close();
+      } catch (error) {
+        errors.push(`runInTerminal: ${errorMessage(error)}`);
+      }
+      try {
         await this.adapter.stopSession();
       } catch (error) {
         errors.push(`stopSession: ${errorMessage(error)}`);
@@ -1125,6 +1136,38 @@ export class DebugSession {
 
   private handleReverseRequest(request: DebugProtocol.Request): void {
     if (this.state.state === "closed") return;
+    if (request.command !== "runInTerminal") {
+      this.sendReverseFailure(request, `Reverse request '${request.command}' is not supported.`);
+      return;
+    }
+    if (this.state.state === "closing") {
+      this.sendReverseFailure(request, "Debug session is closing.");
+      return;
+    }
+
+    let body: DebugProtocol.RunInTerminalResponse["body"];
+    try {
+      body = this.terminals.run((request as DebugProtocol.RunInTerminalRequest).arguments, this.lifetime.signal);
+    } catch (error) {
+      this.sendReverseFailure(request, `Unable to run integrated terminal: ${errorMessage(error)}`);
+      return;
+    }
+
+    try {
+      this.adapter.sendResponse({
+        seq: 0,
+        type: "response",
+        request_seq: request.seq,
+        command: request.command,
+        success: true,
+        body,
+      });
+    } catch (error) {
+      this.handleTransportFailure(error instanceof Error ? error : new Error(String(error)));
+    }
+  }
+
+  private sendReverseFailure(request: DebugProtocol.Request, message: string): void {
     try {
       this.adapter.sendResponse({
         seq: 0,
@@ -1132,11 +1175,17 @@ export class DebugSession {
         request_seq: request.seq,
         command: request.command,
         success: false,
-        message: `Reverse request '${request.command}' is not supported.`,
+        message,
       });
     } catch (error) {
       this.handleTransportFailure(error instanceof Error ? error : new Error(String(error)));
     }
+  }
+
+  private appendOutput(body: DebugProtocol.OutputEvent["body"]): void {
+    if (this.state.state === "closed") return;
+    this.outputEvents.push(body);
+    if (this.outputEvents.length > 1000) this.outputEvents.shift();
   }
 
   private async call<C extends keyof DapRequestMap>(

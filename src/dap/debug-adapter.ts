@@ -3,7 +3,7 @@ import { spawn, type ChildProcess, type SpawnOptions } from "node:child_process"
 import { createConnection, type Socket } from "node:net";
 import { platform } from "node:os";
 import type { Readable, Writable } from "node:stream";
-import treeKill from "tree-kill";
+import { killProcessTree } from "../common/process.js";
 import { AbstractDebugAdapter } from "./abstract-debug-adapter.js";
 
 /** DAP adapter process launch configuration. */
@@ -402,10 +402,6 @@ async function stopProcess(child: ChildProcess | undefined, timeoutMs = 1_000): 
     await killProcessTree(child.pid, "SIGKILL");
     await exited;
   }
-}
-
-function killProcessTree(pid: number, signal: "SIGTERM" | "SIGKILL"): Promise<void> {
-  return new Promise((resolve, reject) => treeKill(pid, signal, (error) => (error ? reject(error) : resolve())));
 }
 
 function delay(ms: number): Promise<void> {
