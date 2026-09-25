@@ -1,6 +1,9 @@
 import type { DebugProtocol } from "@vscode/debugprotocol";
 import type { DebugConfiguration } from "../config/launch-config.js";
 
+/** Stable manager-assigned identity for one debug session. */
+export type DebugSessionId = string;
+
 /** The first reason that initiated session cleanup. */
 export type SessionEndReason = { kind: "requested" } | { kind: "terminated" } | { kind: "error"; message: string };
 
@@ -54,11 +57,26 @@ export interface SessionSnapshot {
   debuggeeExit?: DebuggeeExit;
 }
 
-/** Stop waits at most five seconds per call and may leave cleanup in progress. */
-export type StopResult =
-  | { kind: "noSession" }
-  | { kind: "closing"; snapshot: SessionSnapshot }
-  | { kind: "closed"; snapshot: SessionSnapshot };
+/** A lightweight local view used to discover manager-owned sessions. */
+export interface DebugSessionSummary {
+  sessionId: DebugSessionId;
+  configuration?: Pick<DebugConfiguration, "name" | "type" | "request">;
+  state: SessionState["state"];
+  busy?: boolean;
+  cleanupError?: string;
+}
+
+/** Starting a session returns its manager identity with the initial observations. */
+export interface StartSessionResult {
+  sessionId: DebugSessionId;
+  execution: ExecutionOutcome;
+  breakpoints: BreakpointsSnapshot;
+}
+
+/** Closing waits at most five seconds and may leave cleanup in progress. */
+export type CloseSessionResult =
+  | { kind: "closing"; snapshot?: SessionSnapshot }
+  | { kind: "closed"; snapshot?: SessionSnapshot };
 
 /** One breakpoint's position and optional conditions, with a one-based line number. */
 export interface SourceBreakpointSpec {

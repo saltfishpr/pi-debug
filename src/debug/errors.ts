@@ -1,7 +1,7 @@
 /** Stable failure reasons exposed by the debug tool. */
 export type DebugErrorCode =
   | "INVALID_ARGUMENT"
-  | "NO_SESSION"
+  | "SESSION_NOT_FOUND"
   | "INVALID_STATE"
   | "OPERATION_CONFLICT"
   | "THREAD_NOT_FOUND"

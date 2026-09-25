@@ -3,6 +3,8 @@ import type { DebugConfiguration } from "../config/launch-config.js";
 import { DebugError } from "../debug/errors.js";
 import type {
   BreakpointsSnapshot,
+  CloseSessionResult,
+  DebugSessionSummary,
   EvaluateResult,
   ExecutionOutcome,
   FunctionBreakpointsResult,
@@ -10,12 +12,12 @@ import type {
   SessionSnapshot,
   SourceBreakpointsResult,
   StackResult,
-  StopResult,
+  StartSessionResult,
   ThreadSnapshot,
   VariablesResult,
 } from "../debug/types.js";
 
-export function formatConfigurationsResult(configurations: DebugConfiguration[]) {
+export function formatListConfigurationsResult(configurations: DebugConfiguration[]) {
   return {
     configurations: configurations.map(({ name, type, request }) => ({ name, type, request })),
   };
@@ -43,6 +45,10 @@ export function formatSessionSnapshot(snapshot: SessionSnapshot): FormattedSessi
   };
 }
 
+export function formatSessionSummaries(sessions: DebugSessionSummary[]) {
+  return { sessions };
+}
+
 export function formatExecutionOutcome(result: ExecutionOutcome) {
   return "snapshot" in result ? { ...result, snapshot: formatSessionSnapshot(result.snapshot) } : result;
 }
@@ -67,15 +73,16 @@ export function formatListBreakpointsResult(snapshot: BreakpointsSnapshot) {
   return formatBreakpointsSnapshot(snapshot);
 }
 
-export function formatStartResult(result: { execution: ExecutionOutcome; breakpoints: BreakpointsSnapshot }) {
+export function formatStartResult(result: StartSessionResult) {
   return {
+    sessionId: result.sessionId,
     execution: formatExecutionOutcome(result.execution),
     breakpoints: formatBreakpointsSnapshot(result.breakpoints),
   };
 }
 
-export function formatStopResult(result: StopResult) {
-  return result.kind === "noSession" ? result : { ...result, snapshot: formatSessionSnapshot(result.snapshot) };
+export function formatCloseSessionResult(result: CloseSessionResult) {
+  return result.snapshot ? { ...result, snapshot: formatSessionSnapshot(result.snapshot) } : result;
 }
 
 export function formatThreadSnapshots(page: Page<ThreadSnapshot>) {

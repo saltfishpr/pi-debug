@@ -13,19 +13,20 @@
 
 ### 公共选择和分页规则
 
-- `threadId` 来自 `threads` 或 stopped 结果。检查、继续和单步操作省略它时，优先选择最近停止的线程；否则仅在恰好有一个 stopped 线程时自动选择。未指定线程的执行或等待结果优先返回触发最近一次 stop 事件的线程；若显式等待另一线程且该事件使所有线程暂停，返回的线程可能不是触发者，此时以 `stop.threadId` 判断触发线程。
+- `start` 为新 session 分配并返回不可复用的 `sessionId`；`list_configurations`、`list_sessions` 和 `start` 之外的 action 都必须传入目标 `sessionId`。不自动选择当前或唯一 session。已经接收 `sessionId` 的 action 不在结果中重复它。
+- `threadId` 来自同一 session 的 `threads` 或 stopped 结果。检查、继续和单步操作省略它时，优先选择最近停止的线程；否则仅在恰好有一个 stopped 线程时自动选择。未指定线程的执行或等待结果优先返回触发最近一次 stop 事件的线程；若显式等待另一线程且该事件使所有线程暂停，返回的线程可能不是触发者，此时以 `stop.threadId` 判断触发线程。
 - `frameIndex` 是线程调用栈中的 **zero-based 位置**，不是 DAP frame ID，默认 `0`。
 - `revision` 是 session 内部单调递增的整数，出现在两处：
-  - 结果中：`status` / `stop` 快照顶层 `revision` 反映 session 最新状态版本。`ThreadSnapshot` 在 `state == "stopped"` 时携带引起此次 stop 的 `revision`。`stack_trace`、`variables`、`evaluate` 结果里的 `revision` 与所依赖的 stop revision 相同。线程一旦恢复或状态变化，先前的 `revision` 和一切 `variablesReference` 都失效。
-  - 入参中：`stack_trace`、`variables`（scope 分支）、`evaluate` 传入 `revision` 用于拒绝过期检查——不等于当前 stop revision 就返回 `STALE_REVISION` 错误；省略则跳过校验。`variables` 展开 `variablesReference` 时 `revision` 必填。`wait` 的 `revision` 是等待基线，只返回严格晚于它的新 stop、线程退出或 session 关闭；省略视为无基线。
-- `start` 是 zero-based 分页偏移，默认 `0`。
+  - 结果中：`status` / `close_session` 快照顶层 `revision` 反映 session 最新状态版本。`ThreadSnapshot` 在 `state == "stopped"` 时携带引起此次 stop 的 `revision`。`stack_trace`、`variables`、`evaluate` 结果里的 `revision` 与所依赖的 stop revision 相同。线程一旦恢复或状态变化，先前的 `revision` 和一切 `variablesReference` 都失效。
+  - 入参中：`stack_trace`、`variables`（scope 分支）、`evaluate` 传入 `revision` 用于拒绝过期检查——不等于当前 stop revision 就返回 `STALE_REVISION` 错误；省略则跳过校验。`variables` 展开 `variablesReference` 时 `revision` 必填。`wait` 的 `revision` 是等待基线，只返回严格晚于它的新 stop、线程退出或 session 关闭；省略视为无基线。所有 revision 和 reference 都只能与产生它的 `sessionId` 一起使用。
+- 分页参数 `start` 是 zero-based 偏移，默认 `0`。
 - `count` 默认 `50`；`stack_trace` 默认 `20`；取值范围为 `1..100`。
 - `nextStart` 存在时，用它作为下一次调用的 `start`。`total` 只在实现能确定总数时出现。
 - `waitMs` 是等待新事件的预算，默认 `1000` ms，取值范围为 `0..30000`。超时不会暂停程序，也不会撤销已经发出的执行命令。
 
 ### 公共结果结构
 
-执行控制类 action 返回 `ExecutionOutcome` 以下四种结果之一：
+执行控制类 action 返回 `ExecutionOutcome` 以下五种结果之一：
 
 ```jsonc
 // 命中断点、完成单步或被暂停；`thread` 上的 `revision` 可用于后续 stack_trace / variables / evaluate
@@ -63,14 +64,14 @@
 
 ## 支持的 actions
 
-### `configurations`
+### `list_configurations`
 
 列出项目中保存的 launch/attach 配置。只返回通用字段，不暴露 Adapter 专属配置。
 
 **入参**
 
 ```json
-{ "action": "configurations" }
+{ "action": "list_configurations" }
 ```
 
 **结果示例**
@@ -83,9 +84,38 @@
 }
 ```
 
+### `list_sessions`
+
+列出 manager 当前拥有的 session，只读取本地状态，不向 Adapter 发请求。结果按 session 创建顺序排列。
+
+**入参**
+
+```json
+{ "action": "list_sessions" }
+```
+
+**结果示例**
+
+```json
+{
+  "sessions": [
+    {
+      "sessionId": "debug-1",
+      "configuration": { "name": "Launch API", "type": "go", "request": "launch" },
+      "state": "active",
+      "busy": false
+    },
+    {
+      "sessionId": "debug-2",
+      "state": "starting"
+    }
+  ]
+}
+```
+
 ### `start`
 
-根据保存的配置名或 inline 配置创建 session，安装初始断点，启动或 attach 程序，然后等待新的 stop、线程退出、session 关闭或超时。attach 不会回溯启动前已经发生的事件。
+根据保存的配置名或 inline 配置创建独立 session，安装初始断点，启动或 attach 程序，然后等待新的 stop、线程退出、session 关闭或超时。多个 session 可以并发启动和操作；attach 不会回溯启动前已经发生的事件。
 
 **入参**
 
@@ -140,6 +170,7 @@ Inline 配置保留 Adapter 专属字段：
 
 ```jsonc
 {
+  "sessionId": "debug-1",
   // ExecutionOutcome
   "execution": {
     "kind": "stopped",
@@ -185,12 +216,12 @@ Inline 配置保留 Adapter 专属字段：
 
 ### `status`
 
-返回 session 当前快照，不向 Adapter 刷新线程列表。顶层 `revision` 为 session 目前的版本号，每次线程状态变化递增。`threads` 列表最多展示 50 个线程，stopped 线程排在前面；`totalThreads` 始终反映完整线程数，`omittedThreads` 仅在发生截断时出现，需要完整列表时使用 `threads` action 翻页。
+返回指定 session 的当前快照，不向 Adapter 刷新线程列表。顶层 `revision` 为 session 目前的版本号，每次线程状态变化递增。`threads` 列表最多展示 50 个线程，stopped 线程排在前面；`totalThreads` 始终反映完整线程数，`omittedThreads` 仅在发生截断时出现，需要完整列表时使用 `threads` action 翻页。session 尚未创建 `DebugSession` 时返回 `INVALID_STATE`；可通过 `list_sessions` 查看 manager 生命周期状态。
 
 **入参**
 
 ```json
-{ "action": "status" }
+{ "action": "status", "sessionId": "debug-1" }
 ```
 
 **结果示例**
@@ -230,14 +261,16 @@ Inline 配置保留 Adapter 专属字段：
 
 `capabilities` 是从 Adapter 汇报中挑选出的、影响下发参数选择的开关：`supportsSingleThreadExecutionRequests` 控制 `continue` / 单步的 `singleThread`；`supportsConditionalBreakpoints` / `supportsHitConditionalBreakpoints` / `supportsLogPoints` 控制断点条目上的 `condition` / `hitCondition` / `logMessage`；`supportsFunctionBreakpoints` 控制 `set_function_breakpoints` 与 `initialBreakpoints.function`。未汇报的能力统一表示为 `false`。
 
-### `stop`
+### `close_session`
 
-请求关闭当前 session，等待资源清理完成，并从 manager 中移除 session。重复停止一个已经被移除或启动中止的 session 返回 `noSession`。
+请求关闭指定 session。它会中止尚未完成的启动，并清理 DAP session、Adapter 和 integrated terminal；对于 `launch` session 还可能终止 debuggee。该 action 不表示暂停执行，暂停使用 `pause`。
+
+调用最多等待五秒。所有启动任务和资源清理在预算内完成时返回 `closed` 并从 manager 移除 session；否则返回 `closing`，session 保留在 `list_sessions` 中，可通过 `status` 查看并再次调用 `close_session`。不存在的 ID 返回 `SESSION_NOT_FOUND`。
 
 **入参**
 
 ```json
-{ "action": "stop" }
+{ "action": "close_session", "sessionId": "debug-1" }
 ```
 
 **结果示例**
@@ -261,11 +294,7 @@ Inline 配置保留 Adapter 专属字段：
 }
 ```
 
-无可停止 session 时的结果：
-
-```json
-{ "kind": "noSession" }
-```
+尚未完成时返回 `kind: "closing"`。只有已经创建 `DebugSession` 时才包含 `snapshot`；若在 configuration 或 Adapter resolution 阶段关闭，则省略 `snapshot`。
 
 ### `set_breakpoints`
 
@@ -276,6 +305,7 @@ Inline 配置保留 Adapter 专属字段：
 ```json
 {
   "action": "set_breakpoints",
+  "sessionId": "debug-1",
   "breakpoints": {
     "file": "main.go",
     "lines": [
@@ -329,6 +359,7 @@ Inline 配置保留 Adapter 专属字段：
 ```json
 {
   "action": "set_function_breakpoints",
+  "sessionId": "debug-1",
   "functionBreakpoints": [
     { "name": "main" },
     { "name": "handleRequest", "condition": "req.method == 'POST'" },
@@ -360,12 +391,12 @@ Inline 配置保留 Adapter 专属字段：
 
 ### `list_breakpoints`
 
-返回 session 内已安装的全部断点，覆盖 source、function、exception 三类。不会向 Adapter 发起新的请求，仅返回 session 自身通过历次 `start` / `set_breakpoints` / `set_function_breakpoints` 累积的记录，并按 DAP `breakpoint` 事件同步 `verified`、`message` 等状态。session 尚未启动时返回 `NO_SESSION`；session 处于 `closing` / `closed` 时依然可读，反映最后一次安装的快照。
+返回指定 session 内已安装的全部断点，覆盖 source、function、exception 三类。不会向 Adapter 发起新的请求，仅返回 session 自身通过历次 `start` / `set_breakpoints` / `set_function_breakpoints` 累积的记录，并按 DAP `breakpoint` 事件同步 `verified`、`message` 等状态。session 尚未创建 `DebugSession` 时返回 `INVALID_STATE`；session 处于 `closing` / `closed` 时依然可读，反映最后一次安装的快照。
 
 **入参**
 
 ```json
-{ "action": "list_breakpoints" }
+{ "action": "list_breakpoints", "sessionId": "debug-1" }
 ```
 
 **结果示例**
@@ -413,6 +444,7 @@ Inline 配置保留 Adapter 专属字段：
 ```json
 {
   "action": "continue",
+  "sessionId": "debug-1",
   "threadId": 1,
   "singleThread": false,
   "waitMs": 5000
@@ -430,7 +462,7 @@ Inline 配置保留 Adapter 专属字段：
 **入参**
 
 ```json
-{ "action": "next", "threadId": 1, "singleThread": false, "waitMs": 5000 }
+{ "action": "next", "sessionId": "debug-1", "threadId": 1, "singleThread": false, "waitMs": 5000 }
 ```
 
 **结果示例**
@@ -444,7 +476,7 @@ Inline 配置保留 Adapter 专属字段：
 **入参**
 
 ```json
-{ "action": "step_in", "threadId": 1, "singleThread": false, "waitMs": 5000 }
+{ "action": "step_in", "sessionId": "debug-1", "threadId": 1, "singleThread": false, "waitMs": 5000 }
 ```
 
 **结果示例**
@@ -458,7 +490,7 @@ Inline 配置保留 Adapter 专属字段：
 **入参**
 
 ```json
-{ "action": "step_out", "threadId": 1, "singleThread": false, "waitMs": 5000 }
+{ "action": "step_out", "sessionId": "debug-1", "threadId": 1, "singleThread": false, "waitMs": 5000 }
 ```
 
 **结果示例**
@@ -472,7 +504,7 @@ Inline 配置保留 Adapter 专属字段：
 **入参**
 
 ```json
-{ "action": "pause", "threadId": 1, "waitMs": 5000 }
+{ "action": "pause", "sessionId": "debug-1", "threadId": 1, "waitMs": 5000 }
 ```
 
 **结果示例**
@@ -499,7 +531,7 @@ Inline 配置保留 Adapter 专属字段：
 **入参**
 
 ```json
-{ "action": "wait", "threadId": 1, "revision": 12, "waitMs": 10000 }
+{ "action": "wait", "sessionId": "debug-1", "threadId": 1, "revision": 12, "waitMs": 10000 }
 ```
 
 **结果示例**
@@ -513,7 +545,7 @@ Inline 配置保留 Adapter 专属字段：
 **入参**
 
 ```json
-{ "action": "threads", "start": 0, "count": 50 }
+{ "action": "threads", "sessionId": "debug-1", "start": 0, "count": 50 }
 ```
 
 **结果示例**
@@ -543,7 +575,7 @@ Inline 配置保留 Adapter 专属字段：
 **入参**
 
 ```json
-{ "action": "stack_trace", "threadId": 1, "revision": 12, "start": 0, "count": 20 }
+{ "action": "stack_trace", "sessionId": "debug-1", "threadId": 1, "revision": 12, "start": 0, "count": 20 }
 ```
 
 **结果示例**
@@ -578,6 +610,7 @@ Inline 配置保留 Adapter 专属字段：
 ```json
 {
   "action": "variables",
+  "sessionId": "debug-1",
   "threadId": 1,
   "revision": 12,
   "frameIndex": 0,
@@ -594,6 +627,7 @@ Inline 配置保留 Adapter 专属字段：
 ```json
 {
   "action": "variables",
+  "sessionId": "debug-1",
   "threadId": 1,
   "revision": 12,
   "variablesReference": 2001,
@@ -636,6 +670,7 @@ Inline 配置保留 Adapter 专属字段：
 ```json
 {
   "action": "evaluate",
+  "sessionId": "debug-1",
   "threadId": 1,
   "revision": 12,
   "frameIndex": 0,
@@ -685,6 +720,7 @@ adapter 通过 DAP `runInTerminal` 启动的 integrated terminal 输出也进入
 ```json
 {
   "action": "output",
+  "sessionId": "debug-1",
   "category": "stdout",
   "start": 0,
   "count": 50

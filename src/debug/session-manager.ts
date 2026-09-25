@@ -7,24 +7,42 @@ import { resolveVariables } from "../config/variables.js";
 import { finishesWithin, observe } from "./async.js";
 import { DebugError, throwIfAborted } from "./errors.js";
 import { DebugSession } from "./session.js";
-import type { BreakpointsSnapshot, ExecutionOutcome, InitialBreakpoints, StopResult } from "./types.js";
+import type {
+  CloseSessionResult,
+  DebugSessionId,
+  DebugSessionSummary,
+  InitialBreakpoints,
+  SessionEndReason,
+  SessionSnapshot,
+  StartSessionResult,
+} from "./types.js";
 
 const START_TIMEOUT_MS = 30_000;
 const CLEANUP_WAIT_MS = 5_000;
 
-interface PendingStart {
+interface SessionRecord {
+  id: DebugSessionId;
+  configuration?: DebugConfiguration;
   abort: AbortController;
-  done: Promise<void>;
+  startDone: Promise<void>;
+  finishStart: () => void;
+  state: "starting" | "closing" | "closed";
+  reason?: SessionEndReason;
+  cleanupError?: string;
+  resolving?: Promise<ResolvedDebugAdapter>;
+  lateAdapterCleanup?: Promise<void>;
+  session?: DebugSession;
+  closePromise?: Promise<void>;
 }
 
-/** Own the one debug session associated with this Pi extension session. */
+/** Own multiple independently addressed debug sessions for one Pi extension session. */
 export class DebugSessionManager {
-  private current: DebugSession | undefined;
-  private starting: PendingStart | undefined;
+  private readonly sessionsById = new Map<DebugSessionId, SessionRecord>();
+  private nextSessionId = 1;
   private disposePromise: Promise<void> | undefined;
 
   /** Return complete saved configurations; the tool chooses which fields to display. */
-  async configurations(cwd: string, signal?: AbortSignal): Promise<DebugConfiguration[]> {
+  async listConfigurations(cwd: string, signal?: AbortSignal): Promise<DebugConfiguration[]> {
     this.assertAvailable();
     throwIfAborted(signal);
     const configurations = await observe(loadDebugConfigurations(cwd), signal);
@@ -32,14 +50,31 @@ export class DebugSessionManager {
     return configurations;
   }
 
-  /** Get the current session without transferring ownership to the caller. */
-  get(): DebugSession {
+  /** Return lightweight local state for every manager-owned session. */
+  listSessions(): DebugSessionSummary[] {
     this.assertAvailable();
-    if (!this.current) throw new DebugError("NO_SESSION", "No debug session exists. Call `start` first.");
-    return this.current;
+    return [...this.sessionsById.values()].map((record) => this.summary(record));
   }
 
-  /** Resolve a configuration and start a new session within one setup deadline. */
+  /** Return locally observed state for one initialized session without querying its adapter. */
+  status(sessionId: DebugSessionId): SessionSnapshot {
+    return this.get(sessionId).snapshot();
+  }
+
+  /** Get one session without transferring ownership to the caller. */
+  get(sessionId: DebugSessionId): DebugSession {
+    this.assertAvailable();
+    const record = this.requireRecord(sessionId);
+    if (!record.session) {
+      throw new DebugError("INVALID_STATE", `Debug session '${sessionId}' has not completed startup.`, {
+        sessionId,
+        state: record.state,
+      });
+    }
+    return record.session;
+  }
+
+  /** Resolve a configuration and start a new independently addressed session. */
   async start(
     cwd: string,
     options: {
@@ -48,24 +83,12 @@ export class DebugSessionManager {
       waitMs: number;
     },
     signal?: AbortSignal,
-  ): Promise<{ execution: ExecutionOutcome; breakpoints: BreakpointsSnapshot }> {
+  ): Promise<StartSessionResult> {
     this.assertAvailable();
     throwIfAborted(signal);
-    if (this.starting) throw new DebugError("OPERATION_CONFLICT", "A debug session is already starting.");
-    if (this.current && !this.current.isClosed) {
-      throw new DebugError("INVALID_STATE", "Stop the current debug session before starting another.", {
-        state: this.current.snapshot().state.state,
-      });
-    }
 
-    let finish!: () => void;
-    const pending: PendingStart = {
-      abort: new AbortController(),
-      done: new Promise<void>((resolvePromise) => {
-        finish = resolvePromise;
-      }),
-    };
-    this.starting = pending;
+    const record = this.createRecord();
+    this.sessionsById.set(record.id, record);
 
     const deadline = Date.now() + START_TIMEOUT_MS;
     const timeout = new AbortController();
@@ -73,25 +96,26 @@ export class DebugSessionManager {
       timeoutMs: START_TIMEOUT_MS,
     });
     const timer = setTimeout(() => timeout.abort(timeoutError), START_TIMEOUT_MS);
-    const startSignal = signal ? AbortSignal.any([signal, pending.abort.signal]) : pending.abort.signal;
+    const startSignal = signal ? AbortSignal.any([signal, record.abort.signal]) : record.abort.signal;
     const setupSignal = AbortSignal.any([startSignal, timeout.signal]);
-    let resolving: Promise<ResolvedDebugAdapter> | undefined;
     let resolved: ResolvedDebugAdapter | undefined;
     let session: DebugSession | undefined;
 
     try {
       const configuration = await this.resolveConfiguration(options.configuration, cwd, setupSignal);
+      record.configuration = configuration;
       throwIfAborted(setupSignal);
       if (Date.now() >= deadline) throw timeoutError;
+
       let provider;
       try {
         provider = getDebugAdapterProvider(configuration.type);
       } catch (error) {
         throw new DebugError("INVALID_ARGUMENT", errorMessage(error), { type: configuration.type }, { cause: error });
       }
-      resolving = provider.resolve(configuration, cwd);
+      record.resolving = provider.resolve(configuration, cwd);
       try {
-        resolved = await observe(resolving, setupSignal);
+        resolved = await observe(record.resolving, setupSignal);
       } catch (error) {
         if (error instanceof ZodError) {
           throw new DebugError("INVALID_ARGUMENT", error.message, undefined, { cause: error });
@@ -102,79 +126,155 @@ export class DebugSessionManager {
       if (Date.now() >= deadline) throw timeoutError;
 
       session = new DebugSession(resolved.adapter, resolved.configuration, cwd);
-      this.current = session;
+      record.configuration = resolved.configuration;
+      record.session = session;
       clearTimeout(timer);
-      return await session.start({ breakpoints: options.breakpoints, waitMs: options.waitMs, deadline }, startSignal);
+      const result = await session.start(
+        { breakpoints: options.breakpoints, waitMs: options.waitMs, deadline },
+        startSignal,
+      );
+      return { sessionId: record.id, ...result };
     } catch (error) {
+      record.reason = endReason(error);
       if (!session) {
-        const unused = resolved ? Promise.resolve(resolved) : resolving;
-        // Provider resolution cannot be cancelled; a late transport must not survive this start.
-        if (unused) void unused.then(({ adapter }) => adapter.dispose()).catch(() => undefined);
-      } else if (this.current === session) {
-        const state = session.snapshot().state;
-        if (state.state === "closed" && !state.cleanupError) this.current = undefined;
-        else if (state.state === "closing") {
-          const closingSession = session;
-          void closingSession.close().then(
-            () => {
-              const closed = closingSession.snapshot().state;
-              if (this.current === closingSession && closed.state === "closed" && !closed.cleanupError) {
-                this.current = undefined;
-              }
+        const unused = resolved ? Promise.resolve(resolved) : record.resolving;
+        if (unused) {
+          record.state = "closing";
+          record.lateAdapterCleanup = unused.then(
+            ({ adapter }) => {
+              adapter.dispose();
             },
             () => undefined,
           );
+        } else {
+          record.state = "closed";
         }
       }
-      throw error;
+      this.finishFailedStart(record);
+      throw withSessionId(error, record.id);
     } finally {
       clearTimeout(timer);
-      if (this.starting === pending) this.starting = undefined;
-      finish();
+      record.finishStart();
     }
   }
 
-  /** Interrupt startup and wait up to five seconds for the current session to close. */
-  async stop(): Promise<StopResult> {
-    const starting = this.starting;
-    starting?.abort.abort(new DebugError("CANCELLED", "Debug session startup stopped."));
-    const session = this.current;
-    if (!session) {
-      if (starting) await finishesWithin(starting.done, CLEANUP_WAIT_MS);
-      return { kind: "noSession" };
-    }
+  /** Close one session, waiting at most five seconds for startup and resource cleanup. */
+  async closeSession(sessionId: DebugSessionId): Promise<CloseSessionResult> {
+    this.assertAvailable();
+    const record = this.requireRecord(sessionId);
+    record.closePromise ??= this.closeRecord(record, { kind: "requested" });
 
-    const cleanup = session.close();
-    void cleanup.then(
-      () => {
-        if (this.current === session) this.current = undefined;
-      },
-      () => undefined,
-    );
-    await finishesWithin(cleanup, CLEANUP_WAIT_MS);
-    const snapshot = session.snapshot();
-    return snapshot.state.state === "closed" ? { kind: "closed", snapshot } : { kind: "closing", snapshot };
+    const closed = await finishesWithin(record.closePromise, CLEANUP_WAIT_MS);
+    const snapshot = record.session?.snapshot();
+    if (!closed) return { kind: "closing", ...(snapshot ? { snapshot } : {}) };
+
+    if (this.sessionsById.get(sessionId) === record) this.sessionsById.delete(sessionId);
+    return { kind: "closed", ...(snapshot ? { snapshot } : {}) };
   }
 
-  /** Abort startup and give shared cleanup at most five seconds during shutdown. */
+  /** Abort all startups and give all session cleanup one shared five-second budget. */
   dispose(): Promise<void> {
     if (this.disposePromise) return this.disposePromise;
-    const starting = this.starting;
-    starting?.abort.abort(new DebugError("CANCELLED", "Debug session manager disposed."));
-    const session = this.current;
-    const cleanup = session?.close();
-    if (session && cleanup) {
-      void cleanup.then(
-        () => {
-          if (this.current === session) this.current = undefined;
-        },
-        () => undefined,
-      );
-    }
+    const records = [...this.sessionsById.values()];
+    const cleanups = records.map((record) => {
+      record.closePromise ??= this.closeRecord(record, { kind: "requested" });
+      return record.closePromise;
+    });
     this.disposePromise = (async () => {
-      await finishesWithin(Promise.all([cleanup, starting?.done]), CLEANUP_WAIT_MS);
+      await finishesWithin(Promise.allSettled(cleanups), CLEANUP_WAIT_MS);
+      this.sessionsById.clear();
     })();
     return this.disposePromise;
+  }
+
+  private createRecord(): SessionRecord {
+    let finishStart!: () => void;
+    const startDone = new Promise<void>((resolvePromise) => {
+      finishStart = resolvePromise;
+    });
+    return {
+      id: `debug-${this.nextSessionId++}`,
+      abort: new AbortController(),
+      startDone,
+      finishStart,
+      state: "starting",
+    };
+  }
+
+  private async closeRecord(record: SessionRecord, reason: SessionEndReason): Promise<void> {
+    record.reason ??= reason;
+    record.state = "closing";
+    record.abort.abort(
+      new DebugError("CANCELLED", `Debug session '${record.id}' close requested.`, { sessionId: record.id }),
+    );
+
+    await record.startDone;
+    try {
+      await record.lateAdapterCleanup;
+      await record.session?.close(reason);
+    } catch (error) {
+      record.cleanupError = errorMessage(error);
+    } finally {
+      record.state = "closed";
+    }
+  }
+
+  private finishFailedStart(record: SessionRecord): void {
+    void Promise.resolve().then(async () => {
+      await record.startDone;
+      if (record.session) {
+        const state = record.session.snapshot().state;
+        // Cancelling only the initial observation does not invalidate a session
+        // whose startup handshake already completed.
+        if (state.state === "active") return;
+        await record.session.close(record.reason).catch(() => undefined);
+        const closed = record.session.snapshot().state;
+        if (closed.state === "closed" && closed.cleanupError) record.cleanupError = closed.cleanupError;
+      } else if (record.lateAdapterCleanup) {
+        try {
+          await record.lateAdapterCleanup;
+        } catch (error) {
+          record.cleanupError = errorMessage(error);
+        }
+      }
+      record.state = "closed";
+      if (!record.closePromise && !record.cleanupError && this.sessionsById.get(record.id) === record) {
+        this.sessionsById.delete(record.id);
+      }
+    });
+  }
+
+  private summary(record: SessionRecord): DebugSessionSummary {
+    if (record.session) {
+      const snapshot = record.session.snapshot();
+      const state = snapshot.state;
+      return {
+        sessionId: record.id,
+        configuration: snapshot.configuration,
+        state: state.state,
+        busy: snapshot.busy,
+        ...(state.state === "closed" && state.cleanupError ? { cleanupError: state.cleanupError } : {}),
+      };
+    }
+    return {
+      sessionId: record.id,
+      ...(record.configuration ? { configuration: { ...record.configuration } } : {}),
+      state: record.state,
+      ...(record.cleanupError ? { cleanupError: record.cleanupError } : {}),
+    };
+  }
+
+  private requireRecord(sessionId: DebugSessionId): SessionRecord {
+    const record = this.sessionsById.get(sessionId);
+    if (!record) {
+      const availableSessionIds = [...this.sessionsById.keys()].slice(0, 20);
+      throw new DebugError("SESSION_NOT_FOUND", `Debug session '${sessionId}' does not exist.`, {
+        sessionId,
+        availableSessionIds,
+        totalSessions: this.sessionsById.size,
+      });
+    }
+    return record;
   }
 
   private async resolveConfiguration(
@@ -206,6 +306,17 @@ export class DebugSessionManager {
   private assertAvailable(): void {
     if (this.disposePromise) throw new DebugError("INVALID_STATE", "Debug session manager is disposed.");
   }
+}
+
+function endReason(error: unknown): SessionEndReason {
+  return error instanceof DebugError && error.code === "CANCELLED"
+    ? { kind: "requested" }
+    : { kind: "error", message: errorMessage(error) };
+}
+
+function withSessionId(error: unknown, sessionId: DebugSessionId): unknown {
+  if (!(error instanceof DebugError)) return error;
+  return new DebugError(error.code, error.message, { ...error.details, sessionId }, { cause: error });
 }
 
 function errorMessage(error: unknown): string {

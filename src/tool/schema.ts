@@ -80,10 +80,11 @@ const functionBreakpointSpecSchema = Type.Object(
 
 export const parameters = Type.Object({
   action: StringEnum([
-    "configurations",
+    "list_configurations",
+    "list_sessions",
     "start",
     "status",
-    "stop",
+    "close_session",
     "set_breakpoints",
     "set_function_breakpoints",
     "list_breakpoints",
@@ -99,10 +100,17 @@ export const parameters = Type.Object({
     "evaluate",
     "output",
   ] as const),
+  sessionId: Type.Optional(
+    Type.String({
+      minLength: 1,
+      description:
+        "Required for every session-specific action except `start`; use the ID returned by `start` or `list_sessions`. Thread IDs, revisions, frame selections, and variable references are valid only within this session.",
+    }),
+  ),
   configuration: Type.Optional(
     Type.Union(
       [
-        Type.String({ minLength: 1, description: "For `start`, use an exact name returned by `configurations`." }),
+        Type.String({ minLength: 1, description: "For `start`, use an exact name returned by `list_configurations`." }),
         Type.Object(
           {
             name: Type.String({
@@ -174,7 +182,7 @@ export const parameters = Type.Object({
     Type.Integer({
       minimum: 0,
       description:
-        "For `stack_trace`, `variables`, or `evaluate`, pass the selected thread's revision from a stop or inspection result to reject stale inspections; required when expanding `variablesReference`. For `wait`, a revision is a baseline: return only for a still-valid stop newer than it (or an exit/closure); omit to accept an existing stop. Revisions and references belong to one session and become stale when the thread resumes.",
+        "For `stack_trace`, `variables`, or `evaluate`, pass the selected thread's revision from the same session's stop or inspection result to reject stale inspections; required when expanding `variablesReference`. For `wait`, a revision is a baseline: return only for a still-valid stop newer than it (or an exit/closure); omit to accept an existing stop. Revisions and references belong to the selected `sessionId` and become stale when the thread resumes.",
     }),
   ),
   singleThread: Type.Optional(
@@ -210,7 +218,7 @@ export const parameters = Type.Object({
     Type.Integer({
       minimum: 1,
       description:
-        "For `variables`, expand one level of a value returned by `variables` or `evaluate`. Use its reference with the same thread's current stop `revision`; after resuming, fetch a new reference. Do not combine with `frameIndex` or `scope`.",
+        "For `variables`, expand one level of a value returned by `variables` or `evaluate`. Use its reference with the same `sessionId`, thread, and current stop `revision`; after resuming, fetch a new reference. Do not combine with `frameIndex` or `scope`.",
     }),
   ),
   expressions: Type.Optional(
