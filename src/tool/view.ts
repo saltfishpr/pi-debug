@@ -31,7 +31,15 @@ type FormattedSessionSnapshot = SessionSnapshot & {
 };
 
 export function formatSessionSnapshot(snapshot: SessionSnapshot): FormattedSessionSnapshot {
-  const sorted = [...snapshot.threads].sort(
+  if (snapshot.state.state === "closed") {
+    const { threads = [], ...closedSnapshot } = snapshot;
+    return {
+      ...closedSnapshot,
+      totalThreads: threads.length,
+    };
+  }
+
+  const sorted = [...(snapshot.threads ?? [])].sort(
     (a, b) => Number(b.state === "stopped") - Number(a.state === "stopped") || a.id - b.id,
   );
   const total = sorted.length;
