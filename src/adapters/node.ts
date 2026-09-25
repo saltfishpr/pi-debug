@@ -2,8 +2,9 @@ import { access } from "node:fs/promises";
 import { resolve } from "node:path";
 import { z } from "zod";
 import { pickFreePort } from "../common/port.js";
+import type { DebugConfiguration } from "../config/launch-config.js";
 import { SocketDebugAdapter, SpawnedServerDebugAdapter } from "../dap";
-import type { DebugAdapterProvider } from "./index.js";
+import type { DebugAdapterProvider, ResolvedDebugAdapter } from "./index.js";
 
 const nodeConfigurationSchema = z
   .object({
@@ -35,10 +36,7 @@ export const nodeProvider: DebugAdapterProvider = {
     }
 
     if (config.debugServer !== undefined) {
-      return {
-        adapter: new SocketDebugAdapter({ port: config.debugServer }),
-        configuration: config,
-      };
+      return socketResolution(config, config.debugServer);
     }
 
     const cwd = resolve(workspaceFolder, config.cwd ?? ".");
@@ -52,9 +50,23 @@ export const nodeProvider: DebugAdapterProvider = {
         port,
       }),
       configuration: config,
+      resolveChild: (configuration) => resolveChild(configuration, port),
     };
   },
 };
+
+function resolveChild(configuration: DebugConfiguration, port: number): Promise<ResolvedDebugAdapter> {
+  const config = nodeConfigurationSchema.parse(configuration);
+  return Promise.resolve(socketResolution(config, port));
+}
+
+function socketResolution(configuration: DebugConfiguration, port: number): ResolvedDebugAdapter {
+  return {
+    adapter: new SocketDebugAdapter({ port }),
+    configuration,
+    resolveChild: (child) => resolveChild(child, port),
+  };
+}
 
 /** Locate the `dapDebugServer.js` shipped by vscode-js-debug. */
 async function locateDapDebugServer(override: string | undefined, workspaceFolder: string): Promise<string> {

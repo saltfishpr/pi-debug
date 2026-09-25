@@ -9,6 +9,8 @@ import { pythonProvider } from "./python.js";
 export interface ResolvedDebugAdapter {
   adapter: DebugAdapter;
   configuration: DebugConfiguration;
+  /** Create another session on infrastructure shared with this adapter when required by the debugger. */
+  resolveChild?(configuration: DebugConfiguration): Promise<ResolvedDebugAdapter>;
 }
 
 /** Resolve one debugger's configuration without starting its processes. */

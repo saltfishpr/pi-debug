@@ -13,7 +13,7 @@
 
 ### 公共选择和分页规则
 
-- `start` 为新 session 分配并返回不可复用的 `sessionId`；`list_configurations`、`list_sessions` 和 `start` 之外的 action 都必须传入目标 `sessionId`。不自动选择当前或唯一 session。已经接收 `sessionId` 的 action 不在结果中重复它。
+- `start` 为新 session 分配并返回不可复用的 `sessionId`；Adapter 通过 DAP `startDebugging` 创建的 child session 同样获得独立 `sessionId`，并在 `list_sessions` 中通过 `parentSessionId` 标识来源。`list_configurations`、`list_sessions` 和 `start` 之外的 action 都必须传入目标 `sessionId`。不自动选择当前或唯一 session。已经接收 `sessionId` 的 action 不在结果中重复它。
 - `threadId` 来自同一 session 的 `threads` 或 stopped 结果。检查、继续和单步操作省略它时，优先选择最近停止的线程；否则仅在恰好有一个 stopped 线程时自动选择。未指定线程的执行或等待结果优先返回触发最近一次 stop 事件的线程；若显式等待另一线程且该事件使所有线程暂停，返回的线程可能不是触发者，此时以 `stop.threadId` 判断触发线程。
 - `frameIndex` 是线程调用栈中的 **zero-based 位置**，不是 DAP frame ID，默认 `0`。
 - `revision` 是 session 内部单调递增的整数，出现在两处：
@@ -86,7 +86,7 @@
 
 ### `list_sessions`
 
-列出 manager 当前拥有的 session，只读取本地状态，不向 Adapter 发请求。结果按 session 创建顺序排列。
+列出 manager 当前拥有的 session，只读取本地状态，不向 Adapter 发请求。结果按 session 创建顺序排列。Adapter 自动创建的 child session 带有 `parentSessionId`；child 可独立操作，但关闭 parent 会先关闭它的所有 descendants。
 
 **入参**
 
@@ -107,6 +107,7 @@
     },
     {
       "sessionId": "debug-2",
+      "parentSessionId": "debug-1",
       "state": "starting"
     }
   ]

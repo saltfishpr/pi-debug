@@ -60,6 +60,8 @@ export interface SessionSnapshot {
 /** A lightweight local view used to discover manager-owned sessions. */
 export interface DebugSessionSummary {
   sessionId: DebugSessionId;
+  /** Present when this session was started by another adapter through `startDebugging`. */
+  parentSessionId?: DebugSessionId;
   configuration?: Pick<DebugConfiguration, "name" | "type" | "request">;
   state: SessionState["state"];
   busy?: boolean;

@@ -61,6 +61,12 @@ interface StopEventRecord {
   threadId?: number;
 }
 
+/** Operations supplied by the session owner for cross-session orchestration. */
+export interface DebugSessionHost {
+  startDebugging(arguments_: DebugProtocol.StartDebuggingRequestArguments, signal: AbortSignal): Promise<void>;
+  closeChildren(reason: SessionEndReason): Promise<void>;
+}
+
 /** One DAP session, including its observed thread state and all debug operations. */
 export class DebugSession {
   private readonly client: DapClient;
@@ -97,6 +103,7 @@ export class DebugSession {
     private readonly adapter: DebugAdapter,
     private readonly configuration: DebugConfiguration,
     private readonly cwd: string,
+    private readonly host: DebugSessionHost,
   ) {
     this.client = new DapClient(adapter);
     this.terminals = new IntegratedTerminalHost({
@@ -110,7 +117,7 @@ export class DebugSession {
         void this.close({ kind: "error", message: errorMessage(error) });
       }
     });
-    adapter.onRequest((request) => this.handleReverseRequest(request));
+    adapter.onRequest((request) => void this.handleReverseRequest(request));
     adapter.onError((error) => this.handleTransportFailure(error));
     adapter.onExit((code) => this.handleTransportFailure(new Error(`Debug adapter exited with code ${code}.`)));
   }
@@ -198,7 +205,7 @@ export class DebugSession {
           supportsInvalidatedEvent: true,
           supportsMemoryEvent: false,
           supportsArgsCanBeInterpretedByShell: false,
-          supportsStartDebuggingRequest: false,
+          supportsStartDebuggingRequest: true,
         },
         this.startupRequestTimeout(options.deadline),
         startupSignal,
@@ -1092,6 +1099,11 @@ export class DebugSession {
     const errors: string[] = [];
     try {
       await this.transportStart?.catch(() => undefined);
+      try {
+        await this.host.closeChildren(reason);
+      } catch (error) {
+        errors.push(`child sessions: ${errorMessage(error)}`);
+      }
       if (this.initializedCompleted && this.launchDispatched && !this.transportFailed) {
         const args: DebugProtocol.DisconnectArguments = {};
         if (this.capabilities.supportTerminateDebuggee) {
@@ -1134,25 +1146,47 @@ export class DebugSession {
     void this.close({ kind: "error", message: error.message });
   }
 
-  private handleReverseRequest(request: DebugProtocol.Request): void {
+  private async handleReverseRequest(request: DebugProtocol.Request): Promise<void> {
     if (this.state.state === "closed") return;
-    if (request.command !== "runInTerminal") {
-      this.sendReverseFailure(request, `Reverse request '${request.command}' is not supported.`);
-      return;
-    }
     if (this.state.state === "closing") {
       this.sendReverseFailure(request, "Debug session is closing.");
       return;
     }
 
+    switch (request.command) {
+      case "runInTerminal":
+        this.handleRunInTerminal(request as DebugProtocol.RunInTerminalRequest);
+        return;
+      case "startDebugging":
+        await this.handleStartDebugging(request as DebugProtocol.StartDebuggingRequest);
+        return;
+      default:
+        this.sendReverseFailure(request, `Reverse request '${request.command}' is not supported.`);
+    }
+  }
+
+  private handleRunInTerminal(request: DebugProtocol.RunInTerminalRequest): void {
     let body: DebugProtocol.RunInTerminalResponse["body"];
     try {
-      body = this.terminals.run((request as DebugProtocol.RunInTerminalRequest).arguments, this.lifetime.signal);
+      body = this.terminals.run(request.arguments, this.lifetime.signal);
     } catch (error) {
       this.sendReverseFailure(request, `Unable to run integrated terminal: ${errorMessage(error)}`);
       return;
     }
+    this.sendReverseSuccess(request, body);
+  }
 
+  private async handleStartDebugging(request: DebugProtocol.StartDebuggingRequest): Promise<void> {
+    try {
+      const arguments_ = startDebuggingArguments(request.arguments);
+      await this.host.startDebugging(arguments_, this.lifetime.signal);
+      this.sendReverseSuccess(request);
+    } catch (error) {
+      this.sendReverseFailure(request, `Unable to start child debug session: ${errorMessage(error)}`);
+    }
+  }
+
+  private sendReverseSuccess(request: DebugProtocol.Request, body?: unknown): void {
     try {
       this.adapter.sendResponse({
         seq: 0,
@@ -1160,7 +1194,7 @@ export class DebugSession {
         request_seq: request.seq,
         command: request.command,
         success: true,
-        body,
+        ...(body === undefined ? {} : { body }),
       });
     } catch (error) {
       this.handleTransportFailure(error instanceof Error ? error : new Error(String(error)));
@@ -1268,6 +1302,23 @@ export class DebugSession {
       ...(length === options.count && (total === undefined || next < total) ? { nextStart: next } : {}),
     };
   }
+}
+
+function startDebuggingArguments(value: unknown): DebugProtocol.StartDebuggingRequestArguments {
+  if (!isRecord(value) || !isRecord(value.configuration)) {
+    throw new Error("Invalid startDebugging arguments: `configuration` must be an object.");
+  }
+  if (value.request !== "launch" && value.request !== "attach") {
+    throw new Error("Invalid startDebugging arguments: `request` must be 'launch' or 'attach'.");
+  }
+  return {
+    configuration: value.configuration,
+    request: value.request,
+  };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
 function errorMessage(error: unknown): string {

@@ -30,7 +30,7 @@ export function registerDebugTool(pi: ExtensionAPI, manager: DebugSessionManager
     label: "Debug",
     description: [
       "Manage multiple independently addressed program debugging sessions; `start` returns the `sessionId` required by later session-specific actions.",
-      "Discovery and lifecycle: `list_configurations` finds saved launch settings; `list_sessions` returns local summaries; `start` creates a session from a saved name or inline launch/attach configuration; `status` returns one session snapshot; `close_session` requests cleanup and may return while cleanup is still in progress and may terminate a launched program.",
+      "Discovery and lifecycle: `list_configurations` finds saved launch settings; `list_sessions` returns local summaries, including parent IDs for adapter-created child sessions; `start` creates a session from a saved name or inline launch/attach configuration; `status` returns one session snapshot; `close_session` requests cleanup and may return while cleanup is still in progress and may terminate a launched program and its child sessions.",
       "Breakpoints: `set_breakpoints` replaces one file's breakpoints; `set_function_breakpoints` replaces the selected session's function-name breakpoint list; `list_breakpoints` returns every breakpoint currently installed in that session (source, function, and exception).",
       "Execution: `continue` resumes, `next` steps over, `step_in` enters, `step_out` returns, and `pause` interrupts; `wait` observes stops or exits without controlling execution.",
       "Inspection: `threads` refreshes the thread list; `stack_trace` lists frames; `variables` reads a scope or expands a value; `evaluate` evaluates one or more expressions in order; `output` reads buffered events.",
