@@ -356,7 +356,7 @@ export class DebugSessionManager {
         ...(record.parentId ? { parentSessionId: record.parentId } : {}),
         configuration: snapshot.configuration,
         state: state.state,
-        busy: snapshot.busy,
+        ...(snapshot.operation ? { operation: { ...snapshot.operation } } : {}),
         ...(state.state === "closed" && state.cleanupError ? { cleanupError: state.cleanupError } : {}),
       };
     }

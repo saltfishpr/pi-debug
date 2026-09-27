@@ -51,8 +51,8 @@ export interface SessionSnapshot {
   >;
   state: SessionState;
   revision: number;
-  /** True when another debug operation is in flight; a next call would fail with `OPERATION_CONFLICT`. */
-  busy: boolean;
+  /** The foreground operation, or a detached execution request when no foreground operation is active. */
+  operation?: SessionOperation;
   threads?: ThreadSnapshot[];
   debuggeeExit?: DebuggeeExit;
 }
@@ -64,7 +64,7 @@ export interface DebugSessionSummary {
   parentSessionId?: DebugSessionId;
   configuration?: Pick<DebugConfiguration, "name" | "type" | "request">;
   state: SessionState["state"];
-  busy?: boolean;
+  operation?: SessionOperation;
   cleanupError?: string;
 }
 
@@ -153,6 +153,24 @@ export interface ThreadSelection {
 
 /** Supported execution commands, distinct from passive waiting. */
 export type ExecuteAction = "continue" | "next" | "step_in" | "step_out" | "pause";
+
+/** Public actions serialized when one session operation blocks another. */
+export type SessionOperationAction =
+  | ExecuteAction
+  | "set_breakpoints"
+  | "set_function_breakpoints"
+  | "wait"
+  | "threads"
+  | "stack_trace"
+  | "variables"
+  | "evaluate";
+
+/** A session operation visible to callers while it is in progress. */
+export interface SessionOperation {
+  action: SessionOperationAction;
+  /** UTC timestamp captured when the operation entered the session's concurrency gate. */
+  startedAt: string;
+}
 
 /** Execution selection and observation budget after the request succeeds. */
 export interface ExecuteOptions {

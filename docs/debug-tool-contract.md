@@ -24,6 +24,32 @@
 - `nextStart` 存在时，用它作为下一次调用的 `start`。`total` 只在实现能确定总数时出现。
 - `waitMs` 是等待新事件的预算，默认 `1000` ms，取值范围为 `0..30000`。超时不会暂停程序，也不会撤销已经发出的执行命令。
 
+### 公共错误结构
+
+工具失败时返回的文本包含统一的 `error` object。`action` 是本次被拒绝或失败的 action。`OPERATION_CONFLICT` 还会在 `details.blockingOperation` 中描述实际阻塞它的 action：
+
+```json
+{
+  "error": {
+    "code": "OPERATION_CONFLICT",
+    "message": "Another debug operation is still in progress.",
+    "action": "stack_trace",
+    "details": {
+      "blockingOperation": {
+        "action": "continue",
+        "startedAt": "2026-03-18T08:15:30.412Z"
+      },
+      "retryable": true,
+      "retryWhen": "after_blocking_operation_settles"
+    }
+  }
+}
+```
+
+`blockingOperation.action` 使用 debug tool 的公开 action 名称，不暴露 Adapter command。`startedAt` 是该操作通过 session 并发门禁时记录的 UTC ISO 8601 时间，仅供诊断，不能用于计算剩余 timeout。`retryable: true` 表示本次调用在下发新的 Adapter 请求前被拒绝，可以在阻塞操作结束后重新提交；它不表示应该立即重试，也不保证届时 session、thread、revision 或其他参数仍然有效。当前无法可靠预测阻塞请求何时完成，因此不返回 `retryAfterMs`。
+
+调用方取消等待后，已经发给 Adapter 的 execution 或 breakpoint 请求仍可能继续 pending；在底层请求 settle 前，冲突信息继续引用最初发起请求的 action 和 `startedAt`。`wait` 是例外：它可以在 detached execution request pending 时进入，以继续观察 stop、exit 或关闭事件。source breakpoint 的 pending 冲突仅限制同一路径，function breakpoint 的 pending 冲突仅限制后续 function breakpoint 更新。
+
 ### 公共结果结构
 
 执行控制类 action 返回 `ExecutionOutcome` 以下五种结果之一：
@@ -103,7 +129,10 @@
       "sessionId": "debug-1",
       "configuration": { "name": "Launch API", "type": "go", "request": "launch" },
       "state": "active",
-      "busy": false
+      "operation": {
+        "action": "continue",
+        "startedAt": "2026-03-18T08:15:30.412Z"
+      }
     },
     {
       "sessionId": "debug-2",
@@ -113,6 +142,8 @@
   ]
 }
 ```
+
+`operation` 与 `status` 中的 `SessionSnapshot.operation` 语义相同；session 空闲时省略。
 
 ### `start`
 
@@ -239,6 +270,10 @@ Inline 配置保留 Adapter 专属字段：
     "supportsFunctionBreakpoints": true
   },
   "revision": 12,
+  "operation": {
+    "action": "continue",
+    "startedAt": "2026-03-18T08:15:30.412Z"
+  },
   "threads": [
     {
       "id": 1,
@@ -259,6 +294,8 @@ Inline 配置保留 Adapter 专属字段：
 { "state": "closing", "reason": { "kind": "requested" } }
 { "state": "closed", "reason": { "kind": "terminated" }, "cleanupError": "可选清理错误" }
 ```
+
+`operation` 仅在存在前台 debug 操作或 execution 请求仍 pending 时出现，包含公开 action 和进入 session 并发门禁的时间。前台操作优先于 detached execution request；例如 `wait` 正在观察一个仍 pending 的 `continue` 时，快照返回 `wait`。resource-scoped breakpoint pending 不包含在该字段中。
 
 `capabilities` 是从 Adapter 汇报中挑选出的、影响下发参数选择的开关：`supportsSingleThreadExecutionRequests` 控制 `continue` / 单步的 `singleThread`；`supportsConditionalBreakpoints` / `supportsHitConditionalBreakpoints` / `supportsLogPoints` 控制断点条目上的 `condition` / `hitCondition` / `logMessage`；`supportsFunctionBreakpoints` 控制 `set_function_breakpoints` 与 `initialBreakpoints.function`。未汇报的能力统一表示为 `false`。
 

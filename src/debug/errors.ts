@@ -1,3 +1,5 @@
+import type { SessionOperation } from "./types.js";
+
 /** Stable failure reasons exposed by the debug tool. */
 export type DebugErrorCode =
   | "INVALID_ARGUMENT"
@@ -11,6 +13,13 @@ export type DebugErrorCode =
   | "REQUEST_TIMEOUT"
   | "CONNECTION_ERROR"
   | "CANCELLED";
+
+/** Details that tell a caller when an operation conflict can be retried. */
+export interface OperationConflictDetails extends Record<string, unknown> {
+  blockingOperation: SessionOperation;
+  retryable: true;
+  retryWhen: "after_blocking_operation_settles";
+}
 
 /** A classified debug failure with only the context needed by its caller. */
 export class DebugError extends Error {

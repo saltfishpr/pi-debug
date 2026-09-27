@@ -5,6 +5,7 @@ import type { DapRequestMap, DebugAdapter } from "../dap/index.js";
 import { finishesWithin, observe } from "./async.js";
 import { DapClient } from "./dap-client.js";
 import { abortError, DebugError, throwIfAborted } from "./errors.js";
+import type { OperationConflictDetails } from "./errors.js";
 import { IntegratedTerminalHost } from "./integrated-terminal.js";
 import type {
   BreakpointsSnapshot,
@@ -23,6 +24,8 @@ import type {
   PageInfo,
   PageOptions,
   SessionEndReason,
+  SessionOperation,
+  SessionOperationAction,
   SessionSnapshot,
   SessionState,
   SourceBreakpoints,
@@ -75,11 +78,11 @@ export class DebugSession {
   private readonly threadsById = new Map<number, ThreadRecord>();
   private readonly changeWaiters = new Set<() => void>();
   private readonly outputEvents: DebugProtocol.OutputEvent["body"][] = [];
-  private readonly pendingBreakpointFiles = new Set<string>();
+  private readonly pendingBreakpointFiles = new Map<string, SessionOperation>();
   private readonly installedSourceBreakpoints = new Map<string, SourceBreakpointsResult>();
   private installedFunctionBreakpoints: FunctionBreakpointsResult | undefined;
   private installedExceptionBreakpoints: ExceptionBreakpointsResult | undefined;
-  private pendingFunctionBreakpoints = false;
+  private pendingFunctionBreakpoints: SessionOperation | undefined;
 
   private state: SessionState = { state: "starting" };
   private capabilities: DebugProtocol.Capabilities = {};
@@ -96,8 +99,8 @@ export class DebugSession {
   private transportStart: Promise<void> | undefined;
   private startCalled = false;
   private cleanupPromise: Promise<void> | undefined;
-  private busy = false;
-  private pendingExecution = false;
+  private activeOperation: SessionOperation | undefined;
+  private pendingExecution: SessionOperation | undefined;
 
   constructor(
     private readonly adapter: DebugAdapter,
@@ -128,6 +131,7 @@ export class DebugSession {
 
   /** Return only state already observed locally; this never asks the adapter for threads. */
   snapshot(): SessionSnapshot {
+    const operation = this.activeOperation ?? this.pendingExecution;
     return {
       configuration: {
         name: this.configuration.name,
@@ -143,7 +147,7 @@ export class DebugSession {
       },
       state: structuredClone(this.state),
       revision: this.revision,
-      busy: this.busy || this.pendingExecution,
+      ...(operation ? { operation: { ...operation } } : {}),
       threads: [...this.threadsById.values()]
         .filter((thread) => thread.state !== "exited")
         .sort((a, b) => a.id - b.id)
@@ -284,11 +288,12 @@ export class DebugSession {
 
   /** Replace all source breakpoints in one file. */
   async setBreakpoints(source: SourceBreakpoints, signal?: AbortSignal): Promise<SourceBreakpointsResult> {
-    return this.withOperation(async () => {
+    return this.withOperation("set_breakpoints", async (operation) => {
       this.assertActive();
       const path = resolve(this.cwd, source.file);
-      if (this.pendingBreakpointFiles.has(path)) {
-        throw new DebugError("OPERATION_CONFLICT", `A breakpoint update for '${path}' is still pending.`);
+      const blocker = this.pendingBreakpointFiles.get(path);
+      if (blocker) {
+        throw this.operationConflict(blocker, `A breakpoint update for '${path}' is still pending.`);
       }
       const breakpoints = this.toDapBreakpoints(source.lines);
       const request = this.client.request(
@@ -296,14 +301,14 @@ export class DebugSession {
         { source: { path }, breakpoints },
         { timeoutMs: REQUEST_TIMEOUT_MS },
       );
-      this.pendingBreakpointFiles.add(path);
+      this.pendingBreakpointFiles.set(path, operation);
       const settled = request.then(
         (response) => {
-          this.pendingBreakpointFiles.delete(path);
+          if (this.pendingBreakpointFiles.get(path) === operation) this.pendingBreakpointFiles.delete(path);
           return response;
         },
         (error: unknown) => {
-          this.pendingBreakpointFiles.delete(path);
+          if (this.pendingBreakpointFiles.get(path) === operation) this.pendingBreakpointFiles.delete(path);
           throw error;
         },
       );
@@ -319,24 +324,27 @@ export class DebugSession {
     specs: FunctionBreakpointSpec[],
     signal?: AbortSignal,
   ): Promise<FunctionBreakpointsResult> {
-    return this.withOperation(async () => {
+    return this.withOperation("set_function_breakpoints", async (operation) => {
       this.assertActive();
       if (this.capabilities.supportsFunctionBreakpoints !== true) {
         throw new DebugError("INVALID_ARGUMENT", "This adapter does not support function breakpoints.");
       }
       if (this.pendingFunctionBreakpoints) {
-        throw new DebugError("OPERATION_CONFLICT", "A function-breakpoint update is still pending.");
+        throw this.operationConflict(
+          this.pendingFunctionBreakpoints,
+          "A function-breakpoint update is still pending.",
+        );
       }
       const breakpoints = this.toDapFunctionBreakpoints(specs);
-      this.pendingFunctionBreakpoints = true;
+      this.pendingFunctionBreakpoints = operation;
       const request = this.client.request("setFunctionBreakpoints", { breakpoints }, { timeoutMs: REQUEST_TIMEOUT_MS });
       const settled = request.then(
         (response) => {
-          this.pendingFunctionBreakpoints = false;
+          if (this.pendingFunctionBreakpoints === operation) this.pendingFunctionBreakpoints = undefined;
           return response;
         },
         (error: unknown) => {
-          this.pendingFunctionBreakpoints = false;
+          if (this.pendingFunctionBreakpoints === operation) this.pendingFunctionBreakpoints = undefined;
           throw error;
         },
       );
@@ -349,7 +357,7 @@ export class DebugSession {
 
   /** Execute one control request and observe a currently valid stop, exit, or closure. */
   async execute(action: ExecuteAction, options: ExecuteOptions, signal?: AbortSignal): Promise<ExecutionOutcome> {
-    return this.withOperation(async () => {
+    return this.withOperation(action, async (operation) => {
       this.assertActive();
       this.assertWaitMs(options.waitMs);
       if (action !== "pause" && options.singleThread && !this.capabilities.supportsSingleThreadExecutionRequests) {
@@ -369,7 +377,7 @@ export class DebugSession {
       const args =
         action === "pause" ? { threadId: targetId } : { threadId: targetId, singleThread: options.singleThread };
 
-      this.pendingExecution = true;
+      this.pendingExecution = operation;
       const request = this.client.request(command, args, { timeoutMs: REQUEST_TIMEOUT_MS });
       const settled = request.then(
         (response) => {
@@ -380,11 +388,11 @@ export class DebugSession {
                 : options.singleThread !== true;
             this.applySuccessfulResume(targetId, all, before);
           }
-          this.pendingExecution = false;
+          if (this.pendingExecution === operation) this.pendingExecution = undefined;
           return response;
         },
         (error: unknown) => {
-          this.pendingExecution = false;
+          if (this.pendingExecution === operation) this.pendingExecution = undefined;
           throw error;
         },
       );
@@ -403,6 +411,7 @@ export class DebugSession {
   async wait(options: WaitOptions, signal?: AbortSignal): Promise<ExecutionOutcome> {
     if (this.state.state === "closed") return { kind: "closed", snapshot: this.snapshot() };
     return this.withOperation(
+      "wait",
       async () => {
         if (this.state.state === "starting") throw new DebugError("INVALID_STATE", "Debug session is still starting.");
         this.assertWaitMs(options.waitMs);
@@ -420,7 +429,7 @@ export class DebugSession {
 
   /** Refresh active thread IDs and names, then return the requested page. */
   async threads(page: PageOptions, signal?: AbortSignal): Promise<Page<ThreadSnapshot>> {
-    return this.withOperation(async () => {
+    return this.withOperation("threads", async () => {
       this.assertActive();
       this.assertPage(page);
       const before = new Map([...this.threadsById].map(([id, thread]) => [id, thread.lastChangedRevision]));
@@ -442,7 +451,7 @@ export class DebugSession {
 
   /** Return complete DAP frames for one stack page. */
   async stackTrace(selection: ThreadSelection, page: PageOptions, signal?: AbortSignal): Promise<StackResult> {
-    return this.withOperation(async () => {
+    return this.withOperation("stack_trace", async () => {
       this.assertPage(page);
       const stop = this.selectStoppedThread(selection);
       const paged = this.capabilities.supportsDelayedStackTraceLoading === true;
@@ -470,7 +479,7 @@ export class DebugSession {
 
   /** Read one scope or variable container while its stop revision remains valid. */
   async variables(selection: VariablesSelection, page: PageOptions, signal?: AbortSignal): Promise<VariablesResult> {
-    return this.withOperation(async () => {
+    return this.withOperation("variables", async () => {
       this.assertPage(page);
       const stop = this.selectStoppedThread(selection);
       let reference: number;
@@ -521,7 +530,7 @@ export class DebugSession {
 
   /** Evaluate expressions in a selected stopped frame in order; expressions may have target-side effects observable by later expressions. */
   async evaluate(selection: FrameSelection, expressions: string[], signal?: AbortSignal): Promise<EvaluateResult> {
-    return this.withOperation(async () => {
+    return this.withOperation("evaluate", async () => {
       if (expressions.length === 0) throw new DebugError("INVALID_ARGUMENT", "Expressions must not be empty.");
       for (const expression of expressions) {
         if (!expression.trim()) throw new DebugError("INVALID_ARGUMENT", "Expression must not be empty.");
@@ -1237,17 +1246,36 @@ export class DebugSession {
     return signal ? AbortSignal.any([signal, this.lifetime.signal]) : this.lifetime.signal;
   }
 
-  private async withOperation<T>(work: () => Promise<T>, signal?: AbortSignal, allowPending = false): Promise<T> {
+  private async withOperation<T>(
+    action: SessionOperationAction,
+    work: (operation: SessionOperation) => Promise<T>,
+    signal?: AbortSignal,
+    allowPendingExecution = false,
+  ): Promise<T> {
     throwIfAborted(signal);
-    if (this.busy || (this.pendingExecution && !allowPending)) {
-      throw new DebugError("OPERATION_CONFLICT", "Another debug operation is still in progress.");
+    const blocker = this.activeOperation ?? (!allowPendingExecution ? this.pendingExecution : undefined);
+    if (blocker) {
+      throw this.operationConflict(blocker, "Another debug operation is still in progress.");
     }
-    this.busy = true;
+    const operation: SessionOperation = { action, startedAt: new Date().toISOString() };
+    this.activeOperation = operation;
     try {
-      return await work();
+      return await work(operation);
     } finally {
-      this.busy = false;
+      if (this.activeOperation === operation) this.activeOperation = undefined;
     }
+  }
+
+  private operationConflict(blocker: SessionOperation, message: string): DebugError {
+    const details: OperationConflictDetails = {
+      blockingOperation: {
+        action: blocker.action,
+        startedAt: blocker.startedAt,
+      },
+      retryable: true,
+      retryWhen: "after_blocking_operation_settles",
+    };
+    return new DebugError("OPERATION_CONFLICT", message, details);
   }
 
   private assertActive(): void {
