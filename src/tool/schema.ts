@@ -48,7 +48,7 @@ const sourceBreakpointsSchema = Type.Object(
   },
   {
     description:
-      "One file's complete breakpoint set: pass as `breakpoints` to `set_breakpoints`, or as an entry in `initialBreakpoints.source` to `start`.",
+      "One file's complete breakpoint set: pass as `breakpoints` to `set_breakpoints`, or as an entry in `initialBreakpoints.source` to `start_session`.",
   },
 );
 
@@ -82,7 +82,7 @@ export const parameters = Type.Object({
   action: StringEnum([
     "list_configurations",
     "list_sessions",
-    "start",
+    "start_session",
     "status",
     "close_session",
     "set_breakpoints",
@@ -104,38 +104,38 @@ export const parameters = Type.Object({
     Type.String({
       minLength: 1,
       description:
-        "Required for every session-specific action except `start`; use the ID returned by `start` or `list_sessions`. Thread IDs, revisions, frame selections, and variable references are valid only within this session.",
+        "Required for every session-specific action except `start_session`; use the ID returned by `start_session` or `list_sessions`. Thread IDs, revisions, frame selections, and variable references are valid only within this session.",
     }),
   ),
   configuration: Type.Optional(
     Type.Union(
       [
-        Type.String({ minLength: 1, description: "For `start`, use an exact name returned by `list_configurations`." }),
+        Type.String({ minLength: 1, description: "For `start_session`, use an exact name returned by `list_configurations`." }),
         Type.Object(
           {
             name: Type.String({
               minLength: 1,
-              description: "For an inline `start` configuration, choose a name shown by `status`.",
+              description: "For an inline `start_session` configuration, choose a name shown by `status`.",
             }),
             type: Type.String({
               minLength: 1,
-              description: "For an inline `start` configuration, use the debugger type required by the target.",
+              description: "For an inline `start_session` configuration, use the debugger type required by the target.",
             }),
             request: StringEnum(["launch", "attach"] as const, {
               description:
-                "For inline `start`: `launch` starts a program under the debugger; `attach` connects to one already running.",
+                "For inline `start_session`: `launch` starts a program under the debugger; `attach` connects to one already running.",
             }),
           },
           {
             additionalProperties: true,
             description:
-              "For `start`, supply `name`, `type`, `request`, and any target-specific launch or attach fields (for example, `program`, `args`, or a process selector).",
+              "For `start_session`, supply `name`, `type`, `request`, and any target-specific launch or attach fields (for example, `program`, `args`, or a process selector).",
           },
         ),
       ],
       {
         description:
-          "Required for `start`: select a saved configuration by name or provide an inline configuration. Other actions do not use it.",
+          "Required for `start_session`: select a saved configuration by name or provide an inline configuration. Other actions do not use it.",
       },
     ),
   ),
@@ -159,7 +159,7 @@ export const parameters = Type.Object({
       },
       {
         description:
-          "For `start`, install these breakpoints during session setup, before observing execution. Omit both fields (or the whole object) for no initial breakpoints.",
+          "For `start_session`, install these breakpoints during session setup, before observing execution. Omit both fields (or the whole object) for no initial breakpoints.",
       },
     ),
   ),
@@ -209,7 +209,7 @@ export const parameters = Type.Object({
       minimum: 0,
       maximum: 30000,
       description:
-        "For `start`, `continue`, stepping, `pause`, or `wait`, observe for up to this many milliseconds after setup or a control request completes (default 1000). 0 checks without waiting. This is not a whole-call deadline: requests can take longer, and an observation timeout neither cancels execution nor stops the program.",
+        "For `start_session`, `continue`, stepping, `pause`, or `wait`, observe for up to this many milliseconds after setup or a control request completes (default 1000). 0 checks without waiting. This is not a whole-call deadline: requests can take longer, and an observation timeout neither cancels execution nor stops the program.",
     }),
   ),
   frameIndex: Type.Optional(

@@ -127,7 +127,7 @@ export interface ExceptionBreakpointsResult {
   breakpoints?: DebugProtocol.Breakpoint[];
 }
 
-/** Every breakpoint currently installed in the session; returned by `start` and `list_breakpoints`. */
+/** Every breakpoint currently installed in the session; returned by `start_session` and `list_breakpoints`. */
 export interface BreakpointsSnapshot {
   source: SourceBreakpointsResult[];
   function?: FunctionBreakpointsResult;

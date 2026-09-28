@@ -13,7 +13,7 @@
 
 ### 公共选择和分页规则
 
-- `start` 为新 session 分配并返回不可复用的 `sessionId`；Adapter 通过 DAP `startDebugging` 创建的 child session 同样获得独立 `sessionId`，并在 `list_sessions` 中通过 `parentSessionId` 标识来源。`list_configurations`、`list_sessions` 和 `start` 之外的 action 都必须传入目标 `sessionId`。不自动选择当前或唯一 session。已经接收 `sessionId` 的 action 不在结果中重复它。
+- `start_session` 为新 session 分配并返回不可复用的 `sessionId`；Adapter 通过 DAP `startDebugging` 创建的 child session 同样获得独立 `sessionId`，并在 `list_sessions` 中通过 `parentSessionId` 标识来源。`list_configurations`、`list_sessions` 和 `start_session` 之外的 action 都必须传入目标 `sessionId`。不自动选择当前或唯一 session。已经接收 `sessionId` 的 action 不在结果中重复它。
 - `threadId` 来自同一 session 的 `threads` items 或 stopped 结果的 `stop.thread`。检查、继续和单步操作省略它时，优先选择最近停止的线程；否则仅在恰好有一个 stopped 线程时自动选择。未指定线程的执行或等待结果优先返回触发最近一次 stop 事件的线程。`allThreadsStopped` 使其他线程也可检查，但 stop event 保持为 session-level 信息，不复制到每个线程。
 - `frameIndex` 是线程调用栈中的 **zero-based 位置**，不是 DAP frame ID，默认 `0`。
 - `revision` 是 session 内部单调递增的整数，出现在两处：
@@ -150,7 +150,7 @@
 
 `operation` 与 `status` 中的 `SessionSnapshot.operation` 语义相同；session 空闲时省略。
 
-### `start`
+### `start_session`
 
 根据保存的配置名或 inline 配置创建独立 session，安装初始断点，启动或 attach 程序，然后等待新的 stop、线程退出、session 关闭或超时。多个 session 可以并发启动和操作；attach 不会回溯启动前已经发生的事件。
 
@@ -158,7 +158,7 @@
 
 ```jsonc
 {
-  "action": "start",
+  "action": "start_session",
   "configuration": "Launch API", // 必填；也可以是下面的 inline object
   "initialBreakpoints": {        // 可选，默认 {}
     "source": [                  // 可选，每个 file 最多出现一次，最多 100 项
@@ -192,7 +192,7 @@ Inline 配置保留 Adapter 专属字段：
 
 ```json
 {
-  "action": "start",
+  "action": "start_session",
   "configuration": {
     "name": "Inline Go",
     "type": "go",
@@ -444,7 +444,7 @@ Inline 配置保留 Adapter 专属字段：
 
 ### `list_breakpoints`
 
-返回指定 session 内已安装的全部断点，覆盖 source、function、exception 三类。不会向 Adapter 发起新的请求，仅返回 session 自身通过历次 `start` / `set_breakpoints` / `set_function_breakpoints` 累积的记录，并按 DAP `breakpoint` 事件同步 `verified`、`message` 等状态。session 尚未创建 `DebugSession` 时返回 `INVALID_STATE`；session 处于 `closing` / `closed` 时依然可读，反映最后一次安装的快照。
+返回指定 session 内已安装的全部断点，覆盖 source、function、exception 三类。不会向 Adapter 发起新的请求，仅返回 session 自身通过历次 `start_session` / `set_breakpoints` / `set_function_breakpoints` 累积的记录，并按 DAP `breakpoint` 事件同步 `verified`、`message` 等状态。session 尚未创建 `DebugSession` 时返回 `INVALID_STATE`；session 处于 `closing` / `closed` 时依然可读，反映最后一次安装的快照。
 
 **入参**
 
@@ -486,7 +486,7 @@ Inline 配置保留 Adapter 专属字段：
 }
 ```
 
-`source` 始终存在，无 source 断点时为 `[]`；`function` 只在存在函数断点时出现；`exception` 只在启动时下发了 exception filter 时出现，Adapter 未返回状态时省略其中的 `breakpoints`。结构与 `start` / `set_breakpoints` / `set_function_breakpoints` 返回的相应字段保持一致。
+`source` 始终存在，无 source 断点时为 `[]`；`function` 只在存在函数断点时出现；`exception` 只在启动时下发了 exception filter 时出现，Adapter 未返回状态时省略其中的 `breakpoints`。结构与 `start_session` / `set_breakpoints` / `set_function_breakpoints` 返回的相应字段保持一致。
 
 ### `continue`
 
