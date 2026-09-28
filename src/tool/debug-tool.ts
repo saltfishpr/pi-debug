@@ -18,7 +18,7 @@ import {
   formatSetFunctionBreakpointsResult,
   formatStackTraceResult,
   formatStartResult,
-  formatThreadSnapshots,
+  formatThreadsResult,
   formatVariablesResult,
   resultText,
 } from "./view.js";
@@ -33,16 +33,16 @@ export function registerDebugTool(pi: ExtensionAPI, manager: DebugSessionManager
       "Discovery and lifecycle: `list_configurations` finds saved launch settings; `list_sessions` returns local summaries, including parent IDs for adapter-created child sessions; `start` creates a session from a saved name or inline launch/attach configuration; `status` returns one session snapshot; `close_session` requests cleanup and may return while cleanup is still in progress and may terminate a launched program and its child sessions.",
       "Breakpoints: `set_breakpoints` replaces one file's breakpoints; `set_function_breakpoints` replaces the selected session's function-name breakpoint list; `list_breakpoints` returns every breakpoint currently installed in that session (source, function, and exception).",
       "Execution: `continue` resumes, `next` steps over, `step_in` enters, `step_out` returns, and `pause` interrupts; `wait` observes stops or exits without controlling execution.",
-      "Inspection: `threads` refreshes the thread list; `stack_trace` lists frames; `variables` reads a scope or expands a value; `evaluate` evaluates one or more expressions in order; `output` reads buffered events.",
+      "Inspection: `threads` refreshes, filters, and pages a relevance-ordered thread list; `stack_trace` lists frames; `variables` reads a scope or expands a value; `evaluate` evaluates one or more expressions in order; `output` reads buffered events.",
     ].join(" "),
     promptSnippet:
       "Debug programs by controlling execution and inspecting runtime evidence when static analysis is insufficient.",
     promptGuidelines: [
       "Use debug to test a concrete runtime hypothesis: stop where the evidence can distinguish possible causes, inspect the state, revise the hypothesis and repeat until the behavior is explained, then stop the session.",
       "Use debug `list_sessions` to discover session IDs, and keep each thread ID, revision, and variable reference with the `sessionId` that returned it.",
-      "Use debug `status` or `threads` when session state or thread selection is unclear.",
+      "Use debug `status` for bounded thread counts and the current stop; use debug `threads` with `state` or `nameContains` to find a thread in a large list.",
       "Use debug `wait` or `status` after an observation timeout rather than assuming execution stopped; avoid debug `evaluate` expressions with side effects unless necessary.",
-      "Use debug `wait` with a `threadId` and no `revision` to retrieve that thread's current stop (revision and stop body) without waiting for a new event.",
+      "Use debug `wait` with a `threadId` and no `revision` to retrieve that thread's current inspection revision and associated stop event without waiting for a new event.",
       "Use debug `close_session` when finished; `pause` only suspends execution and keeps the session open.",
     ],
     parameters,
@@ -136,8 +136,15 @@ export function registerDebugTool(pi: ExtensionAPI, manager: DebugSessionManager
           }
           case "threads": {
             const sessionId = requireSessionId(args);
-            const result = await manager.get(sessionId).threads(pageOptions(args), signal);
-            return done(resultText(formatThreadSnapshots(result)));
+            const result = await manager.get(sessionId).threads(
+              {
+                ...pageOptions(args, 20),
+                state: args.state,
+                nameContains: args.nameContains,
+              },
+              signal,
+            );
+            return done(resultText(formatThreadsResult(result)));
           }
           case "stack_trace": {
             const sessionId = requireSessionId(args);

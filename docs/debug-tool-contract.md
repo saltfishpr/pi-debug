@@ -14,13 +14,13 @@
 ### 公共选择和分页规则
 
 - `start` 为新 session 分配并返回不可复用的 `sessionId`；Adapter 通过 DAP `startDebugging` 创建的 child session 同样获得独立 `sessionId`，并在 `list_sessions` 中通过 `parentSessionId` 标识来源。`list_configurations`、`list_sessions` 和 `start` 之外的 action 都必须传入目标 `sessionId`。不自动选择当前或唯一 session。已经接收 `sessionId` 的 action 不在结果中重复它。
-- `threadId` 来自同一 session 的 `threads` 或 stopped 结果。检查、继续和单步操作省略它时，优先选择最近停止的线程；否则仅在恰好有一个 stopped 线程时自动选择。未指定线程的执行或等待结果优先返回触发最近一次 stop 事件的线程；若显式等待另一线程且该事件使所有线程暂停，返回的线程可能不是触发者，此时以 `stop.threadId` 判断触发线程。
+- `threadId` 来自同一 session 的 `threads` items 或 stopped 结果的 `stop.thread`。检查、继续和单步操作省略它时，优先选择最近停止的线程；否则仅在恰好有一个 stopped 线程时自动选择。未指定线程的执行或等待结果优先返回触发最近一次 stop 事件的线程。`allThreadsStopped` 使其他线程也可检查，但 stop event 保持为 session-level 信息，不复制到每个线程。
 - `frameIndex` 是线程调用栈中的 **zero-based 位置**，不是 DAP frame ID，默认 `0`。
 - `revision` 是 session 内部单调递增的整数，出现在两处：
-  - 结果中：`status` / `close_session` 快照顶层 `revision` 反映 session 最新状态版本。`ThreadSnapshot` 在 `state == "stopped"` 时携带引起此次 stop 的 `revision`。`stack_trace`、`variables`、`evaluate` 结果里的 `revision` 与所依赖的 stop revision 相同。线程一旦恢复或状态变化，先前的 `revision` 和一切 `variablesReference` 都失效。
+  - 结果中：`status` / `close_session` 快照顶层 `revision` 反映 session 最新状态版本。`Thread` 在 `state == "stopped"` 时携带当前 suspended state 的 inspection revision。停止原因位于 `Stop.event`，触发线程仍可检查时位于 `Stop.thread`。`stack_trace`、`variables`、`evaluate` 结果里的 `revision` 与所依赖的 inspection revision 相同。线程一旦恢复或状态变化，先前的 `revision` 和一切 `variablesReference` 都失效。
   - 入参中：`stack_trace`、`variables`（scope 分支）、`evaluate` 传入 `revision` 用于拒绝过期检查——不等于当前 stop revision 就返回 `STALE_REVISION` 错误；省略则跳过校验。`variables` 展开 `variablesReference` 时 `revision` 必填。`wait` 的 `revision` 是等待基线，只返回严格晚于它的新 stop、线程退出或 session 关闭；省略视为无基线。所有 revision 和 reference 都只能与产生它的 `sessionId` 一起使用。
 - 分页参数 `start` 是 zero-based 偏移，默认 `0`。
-- `count` 默认 `50`；`stack_trace` 默认 `20`；取值范围为 `1..100`。
+- `count` 对 `threads` 和 `stack_trace` 默认 `20`，对 `variables` 和 `output` 默认 `50`；取值范围为 `1..100`。
 - `nextStart` 存在时，用它作为下一次调用的 `start`。`total` 只在实现能确定总数时出现。
 - `waitMs` 是等待新事件的预算，默认 `1000` ms，取值范围为 `0..30000`。超时不会暂停程序，也不会撤销已经发出的执行命令。
 
@@ -52,29 +52,34 @@
 
 ### 公共结果结构
 
-执行控制类 action 返回 `ExecutionOutcome` 以下五种结果之一：
+执行控制类 action 返回 `ExecutionOutcome` 以下四种结果之一：
 
 ```jsonc
-// 命中断点、完成单步或被暂停；`thread` 上的 `revision` 可用于后续 stack_trace / variables / evaluate
+// 命中断点、完成单步或被暂停；`stop.thread.revision` 可用于后续 stack_trace / variables / evaluate
 {
   "kind": "stopped",
-  "thread": {
-    "id": 1,
-    "name": "main",
-    "state": "stopped",
+  "stop": {
     "revision": 12,
-    "stop": {
+    "event": {
       // ...DebugProtocol.StoppedEvent["body"]
+    },
+    "thread": {
+      "id": 1,
+      "name": "main",
+      "state": "stopped",
+      "revision": 12
     }
   }
 }
 
-// stop 事件未标注 threadId 时用该结构，不推测触发线程
+// stop 事件未标注 threadId 时不推测触发线程，省略 `stop.thread`
 {
   "kind": "stopped",
-  "revision": 12,
   "stop": {
-    // ...DebugProtocol.StoppedEvent["body"]
+    "revision": 12,
+    "event": {
+      // ...DebugProtocol.StoppedEvent["body"]
+    }
   }
 }
 
@@ -206,12 +211,10 @@ Inline 配置保留 Adapter 专属字段：
   // ExecutionOutcome
   "execution": {
     "kind": "stopped",
-    "thread": {
-      "id": 1,
-      "name": "main",
-      "state": "stopped",
+    "stop": {
       "revision": 3,
-      "stop": { "reason": "breakpoint", "allThreadsStopped": true }
+      "event": { "reason": "breakpoint", "threadId": 1, "allThreadsStopped": true },
+      "thread": { "id": 1, "name": "main", "state": "stopped", "revision": 3 }
     }
   },
   "breakpoints": {
@@ -248,7 +251,7 @@ Inline 配置保留 Adapter 专属字段：
 
 ### `status`
 
-返回指定 session 的当前快照，不向 Adapter 刷新线程列表。顶层 `revision` 为 session 目前的版本号，每次线程状态变化递增。`threads` 列表最多展示 50 个线程，stopped 线程排在前面；`totalThreads` 始终反映完整线程数，`omittedThreads` 仅在发生截断时出现，需要完整列表时使用 `threads` action 翻页。session 尚未创建 `DebugSession` 时返回 `INVALID_STATE`；可通过 `list_sessions` 查看 manager 生命周期状态。
+返回指定 session 的当前有界快照，不向 Adapter 刷新线程列表。顶层 `revision` 为 session 目前的版本号，每次线程状态变化递增。`stop` 是最近一次仍有效的停止信息：`stop.event` 是 Adapter 事件，`stop.thread` 在触发线程仍停止时给出可直接检查的 ID 和 revision。`threadCounts.total` 和 `threadCounts.byState` 汇总本地已知 active 线程，快照不枚举线程。需要完整或筛选后的列表时使用 `threads`。session 尚未创建 `DebugSession` 时返回 `INVALID_STATE`；可通过 `list_sessions` 查看 manager 生命周期状态。
 
 **入参**
 
@@ -274,15 +277,24 @@ Inline 配置保留 Adapter 专属字段：
     "action": "continue",
     "startedAt": "2026-03-18T08:15:30.412Z"
   },
-  "threads": [
-    {
-      "id": 1,
-      "name": "main",
+  "stop": {
+    "revision": 12,
+    "event": {
+      "reason": "breakpoint",
+      "threadId": 900,
+      "allThreadsStopped": true
+    },
+    "thread": {
+      "id": 900,
+      "name": "* [Go 900] main.worker",
       "state": "stopped",
-      "revision": 12,
-      "stop": { "reason": "breakpoint", "allThreadsStopped": true }
+      "revision": 12
     }
-  ]
+  },
+  "threadCounts": {
+    "total": 1024,
+    "byState": { "unknown": 0, "running": 0, "stopped": 1024 }
+  }
 }
 ```
 
@@ -327,7 +339,10 @@ Inline 配置保留 Adapter 专属字段：
       "supportsFunctionBreakpoints": true
     },
     "revision": 15,
-    "threads": []
+    "threadCounts": {
+      "total": 0,
+      "byState": { "unknown": 0, "running": 0, "stopped": 0 }
+    }
   }
 }
 ```
@@ -550,12 +565,10 @@ Inline 配置保留 Adapter 专属字段：
 ```json
 {
   "kind": "stopped",
-  "thread": {
-    "id": 1,
-    "name": "main",
-    "state": "stopped",
+  "stop": {
     "revision": 20,
-    "stop": { "reason": "pause" }
+    "event": { "reason": "pause", "threadId": 1 },
+    "thread": { "id": 1, "name": "main", "state": "stopped", "revision": 20 }
   }
 }
 ```
@@ -578,12 +591,12 @@ Inline 配置保留 Adapter 专属字段：
 
 ### `threads`
 
-向 Adapter 刷新线程，并返回 active 线程的分页列表。stopped 线程携带引起此次 stop 的 `revision`，可直接作为 `stack_trace` / `variables` / `evaluate` 的 `revision` 传入。
+向 Adapter 刷新 active 线程列表，按 stop trigger、其他 stopped、running、unknown 的顺序返回分页结果，同组内按 ID 排序。可用 `state` 精确筛选本地状态，用 `nameContains` 对名称做大小写不敏感的 substring 筛选；筛选发生在分页前，`total` 是筛选后的数量。stopped 线程携带可用于 `stack_trace` / `variables` / `evaluate` 的 `revision`；停止原因通过 `status.stop` 或执行结果获取，不复制到线程条目。
 
 **入参**
 
 ```json
-{ "action": "threads", "sessionId": "debug-1", "start": 0, "count": 50 }
+{ "action": "threads", "sessionId": "debug-1", "state": "stopped", "nameContains": "worker", "start": 0, "count": 2 }
 ```
 
 **结果示例**
@@ -592,17 +605,16 @@ Inline 配置保留 Adapter 专属字段：
 {
   "start": 0,
   "items": [
-    { "id": 1, "name": "main", "state": "running" },
     {
-      "id": 2,
-      "name": "worker",
+      "id": 900,
+      "name": "* [Go 900] main.worker",
       "state": "stopped",
-      "revision": 12,
-      "stop": { "reason": "breakpoint", "allThreadsStopped": false }
-    }
+      "revision": 12
+    },
+    { "id": 901, "name": "[Go 901] main.worker", "state": "stopped", "revision": 12 }
   ],
   "nextStart": 2,
-  "total": 8
+  "total": 37
 }
 ```
 

@@ -175,14 +175,27 @@ export const parameters = Type.Object({
     Type.Integer({
       minimum: 1,
       description:
-        "For execution and inspection, use a thread ID from `threads` or a stop result. `continue`, stepping, `stack_trace`, `variables`, and `evaluate` require a stopped thread: omission selects the last-stopped thread if still stopped, otherwise the sole stopped thread. `pause` requires a running or unknown-state thread; omit its ID only if exactly one qualifies. For `wait`, omit to observe any stop or session closure, or specify an ID to observe that thread's stop or exit (or closure).",
+        "For execution and inspection, use a thread ID from `threads` or `stop.thread`. `continue`, stepping, `stack_trace`, `variables`, and `evaluate` require a stopped thread: omission selects the last-stopped thread if still stopped, otherwise the sole stopped thread. `pause` requires a running or unknown-state thread; omit its ID only if exactly one qualifies. For `wait`, omit to observe any stop or session closure, or specify an ID to observe that thread's stop or exit (or closure)."
+    }),
+  ),
+  state: Type.Optional(
+    StringEnum(["stopped", "running", "unknown"] as const, {
+      description:
+        "For `threads`, return only threads whose locally observed execution state exactly matches this value. Omit to include every active thread. Use `status.threadCounts` for bounded counts without refreshing."
+    }),
+  ),
+  nameContains: Type.Optional(
+    Type.String({
+      minLength: 1,
+      description:
+        "For `threads`, return only thread names containing this text, using case-insensitive matching. Combine with `state` to narrow large thread lists.",
     }),
   ),
   revision: Type.Optional(
     Type.Integer({
       minimum: 0,
       description:
-        "For `stack_trace`, `variables`, or `evaluate`, pass the selected thread's revision from the same session's stop or inspection result to reject stale inspections; required when expanding `variablesReference`. For `wait`, a revision is a baseline: return only for a still-valid stop newer than it (or an exit/closure); omit to accept an existing stop. Revisions and references belong to the selected `sessionId` and become stale when the thread resumes.",
+        "For `stack_trace`, `variables`, or `evaluate`, pass the selected thread's revision from `threads`, `stop.thread`, or an inspection result to reject stale inspections; required when expanding `variablesReference`. For `wait`, a revision is a baseline: return only for a still-valid stop newer than it (or an exit/closure); omit to accept an existing stop. Revisions and references belong to the selected `sessionId` and become stale when the thread resumes."
     }),
   ),
   singleThread: Type.Optional(
@@ -233,7 +246,7 @@ export const parameters = Type.Object({
     Type.Integer({
       minimum: 0,
       description:
-        "For `threads`, `stack_trace`, `variables`, or `output`, skip this many entries from the selected list (zero-based; default 0). Use `nextStart` with the same selection for the next page. For `output`, filtering happens first; new or evicted events may shift later pages.",
+        "For `threads`, `stack_trace`, `variables`, or `output`, skip this many entries from the selected list (zero-based; default 0). Use `nextStart` with the same selection for the next page. Filtering happens before pagination. Each `threads` page refreshes the list, while new or evicted `output` events may shift later pages.",
     }),
   ),
   count: Type.Optional(
@@ -241,7 +254,7 @@ export const parameters = Type.Object({
       minimum: 1,
       maximum: 100,
       description:
-        "For `threads`, `stack_trace`, `variables`, or `output`, cap the number of entries in a page. Default: 20 for `stack_trace`, 50 for the others.",
+        "For `threads`, `stack_trace`, `variables`, or `output`, cap the number of entries in a page. Default: 20 for `threads` and `stack_trace`, 50 for `variables` and `output`.",
     }),
   ),
   category: Type.Optional(

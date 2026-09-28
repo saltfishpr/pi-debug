@@ -19,6 +19,7 @@ import type {
   FunctionBreakpointSpec,
   FunctionBreakpointsResult,
   InitialBreakpoints,
+  InspectionTarget,
   OutputOptions,
   Page,
   PageInfo,
@@ -33,11 +34,10 @@ import type {
   SourceBreakpointsResult,
   StackResult,
   StartOptions,
-  StopContext,
-  StoppedThread,
+  Stop,
+  Thread,
   ThreadSelection,
-  ThreadSnapshot,
-  ThreadState,
+  ThreadsOptions,
   VariablesResult,
   VariablesSelection,
   WaitOptions,
@@ -47,6 +47,8 @@ const REQUEST_TIMEOUT_MS = 10_000;
 const DISCONNECT_TIMEOUT_MS = 2_000;
 const START_CLEANUP_WAIT_MS = 5_000;
 
+type ThreadState = Thread["state"] | "exited";
+
 interface ThreadRecord {
   id: number;
   name?: string;
@@ -55,7 +57,7 @@ interface ThreadRecord {
   lastChangedRevision: number;
   // Keep references valid across unrelated stops while this thread stays stopped.
   stopRevision?: number;
-  stop?: DebugProtocol.StoppedEvent["body"];
+  stop?: StopEventRecord;
 }
 
 interface StopEventRecord {
@@ -132,6 +134,8 @@ export class DebugSession {
   /** Return only state already observed locally; this never asks the adapter for threads. */
   snapshot(): SessionSnapshot {
     const operation = this.activeOperation ?? this.pendingExecution;
+    const activeThreads = [...this.threadsById.values()].filter((thread) => thread.state !== "exited");
+    const currentStop = this.state.state === "active" && this.lastStop ? this.toStop(this.lastStop) : undefined;
     return {
       configuration: {
         name: this.configuration.name,
@@ -148,10 +152,8 @@ export class DebugSession {
       state: structuredClone(this.state),
       revision: this.revision,
       ...(operation ? { operation: { ...operation } } : {}),
-      threads: [...this.threadsById.values()]
-        .filter((thread) => thread.state !== "exited")
-        .sort((a, b) => a.id - b.id)
-        .map((thread) => this.threadSnapshot(thread)),
+      ...(currentStop ? { stop: currentStop } : {}),
+      threadCounts: this.countThreads(activeThreads),
       ...(this.debuggeeExit ? { debuggeeExit: { ...this.debuggeeExit } } : {}),
     };
   }
@@ -427,11 +429,11 @@ export class DebugSession {
     );
   }
 
-  /** Refresh active thread IDs and names, then return the requested page. */
-  async threads(page: PageOptions, signal?: AbortSignal): Promise<Page<ThreadSnapshot>> {
+  /** Refresh active threads, then return a relevance-ordered filtered page. */
+  async threads(options: ThreadsOptions, signal?: AbortSignal): Promise<Page<Thread>> {
     return this.withOperation("threads", async () => {
       this.assertActive();
-      this.assertPage(page);
+      this.assertPage(options);
       const before = new Map([...this.threadsById].map(([id, thread]) => [id, thread.lastChangedRevision]));
       const response = await this.call("threads", undefined, REQUEST_TIMEOUT_MS, signal);
       this.assertActive();
@@ -439,13 +441,17 @@ export class DebugSession {
         throw new DebugError("CONNECTION_ERROR", "Malformed threads response.");
       }
       this.applyThreadsResponse(response.body.threads, before);
-      const active = [...this.threadsById.values()]
-        .filter((thread) => thread.state !== "exited")
-        .sort((a, b) => a.id - b.id);
-      return this.page(
-        active.map((thread) => this.threadSnapshot(thread)),
-        page,
-      );
+      const active = [...this.threadsById.values()].filter((thread) => thread.state !== "exited");
+      const query = options.nameContains?.toLowerCase();
+      const filtered = active
+        .filter((thread) => options.state === undefined || thread.state === options.state)
+        .filter((thread) => query === undefined || (thread.name ?? "").toLowerCase().includes(query))
+        .sort((a, b) => this.compareThreads(a, b));
+      const selected = filtered.slice(options.start, options.start + options.count);
+      return {
+        ...this.pageInfo(options, selected.length, filtered.length),
+        items: selected.map((thread) => this.toThread(thread)),
+      };
     }, signal);
   }
 
@@ -745,7 +751,7 @@ export class DebugSession {
     return pausable[0];
   }
 
-  private selectStoppedThread(selection: ThreadSelection): StopContext {
+  private selectStoppedThread(selection: ThreadSelection): InspectionTarget {
     this.assertActive();
     let thread: ThreadRecord | undefined;
     if (selection.threadId !== undefined) {
@@ -786,7 +792,9 @@ export class DebugSession {
     const revision = ++this.revision;
     for (const thread of unchanged) this.setRunning(thread, revision);
     this.pendingAllStop = undefined;
-    this.lastStop = undefined;
+    if (all || this.lastStop?.threadId === undefined || this.lastStop.threadId === threadId) {
+      this.lastStop = undefined;
+    }
     this.notifyChange();
   }
 
@@ -814,7 +822,7 @@ export class DebugSession {
       const thread = this.threadsById.get(threadId);
       if (thread?.state === "exited") return { kind: "threadExited", threadId };
       if (thread?.state === "stopped" && thread.stopRevision !== undefined && thread.stopRevision > baseline) {
-        return { kind: "stopped", thread: this.stoppedThread(thread) };
+        return { kind: "stopped", stop: this.stopForThread(thread) };
       }
       return undefined;
     }
@@ -822,24 +830,14 @@ export class DebugSession {
       return { kind: "threadExited", threadId: selectedThreadId };
     }
     if (this.lastStop && this.lastStop.revision > baseline) {
-      if (this.lastStop.threadId === undefined) {
-        return { kind: "stopped", revision: this.lastStop.revision, stop: structuredClone(this.lastStop.body) };
-      }
-      const trigger = this.threadsById.get(this.lastStop.threadId);
-      if (trigger?.state === "stopped" && trigger.stopRevision === this.lastStop.revision) {
-        return { kind: "stopped", thread: this.stoppedThread(trigger) };
-      }
+      return { kind: "stopped", stop: this.toStop(this.lastStop) };
     }
     const stopped = [...this.threadsById.values()]
       .filter(
-        (thread) =>
-          thread.state === "stopped" &&
-          thread.stopRevision !== undefined &&
-          thread.stopRevision > baseline &&
-          thread.stop?.threadId === thread.id,
+        (thread) => thread.state === "stopped" && thread.stopRevision !== undefined && thread.stopRevision > baseline,
       )
       .sort((a, b) => b.stopRevision! - a.stopRevision!);
-    if (stopped.length) return { kind: "stopped", thread: this.stoppedThread(stopped[0]) };
+    if (stopped.length) return { kind: "stopped", stop: this.stopForThread(stopped[0]) };
     return undefined;
   }
 
@@ -871,6 +869,7 @@ export class DebugSession {
   }
 
   private applyThreadsResponse(values: DebugProtocol.Thread[], before: ReadonlyMap<number, number>): void {
+    const pendingAllStop = this.pendingAllStop;
     const activeIds = new Set(values.map((thread) => thread.id));
     const disappeared = [...this.threadsById.values()].filter(
       (thread) =>
@@ -891,19 +890,31 @@ export class DebugSession {
     for (const value of values) {
       const existing = this.threadsById.get(value.id);
       if (existing) {
+        const previousRevision = before.get(value.id);
+        const unchanged = previousRevision === existing.lastChangedRevision;
         existing.name = value.name;
-        if (existing.state === "exited" && before.get(value.id) === existing.lastChangedRevision) {
+        if (existing.state === "exited" && unchanged) {
           existing.state = "unknown";
           existing.lastChangedRevision = revision;
         }
+        const unchangedSinceRequest =
+          previousRevision !== undefined
+            ? unchanged && previousRevision <= (pendingAllStop?.revision ?? -1)
+            : existing.lastChangedRevision <= (pendingAllStop?.revision ?? -1);
+        if (pendingAllStop && unchangedSinceRequest) {
+          this.setStopped(
+            existing,
+            pendingAllStop.revision,
+            pendingAllStop,
+          );
+        }
       } else {
-        const stopped = this.pendingAllStop;
         this.threadsById.set(value.id, {
           id: value.id,
           name: value.name,
-          state: stopped ? "stopped" : "unknown",
+          state: pendingAllStop ? "stopped" : "unknown",
           lastChangedRevision: revision,
-          ...(stopped ? { stopRevision: stopped.revision, stop: stopped.body } : {}),
+          ...(pendingAllStop ? { stopRevision: pendingAllStop.revision, stop: pendingAllStop } : {}),
         });
       }
     }
@@ -911,8 +922,66 @@ export class DebugSession {
     if (disappeared.length || discovered.length) this.notifyChange();
   }
 
+  private toThread(thread: ThreadRecord): Thread {
+    const identity = {
+      id: thread.id,
+      ...(thread.name !== undefined ? { name: thread.name } : {}),
+    };
+    if (thread.state === "stopped" && thread.stopRevision !== undefined) {
+      return { ...identity, state: "stopped", revision: thread.stopRevision };
+    }
+    switch (thread.state) {
+      case "unknown":
+      case "running":
+        return { ...identity, state: thread.state };
+      case "stopped":
+        throw new Error(`Stopped thread ${thread.id} has no inspection revision.`);
+      case "exited":
+        throw new Error(`Exited thread ${thread.id} cannot be exposed as active.`);
+    }
+  }
+
+  private toStop(stop: StopEventRecord, target?: ThreadRecord): Stop {
+    const record = target ?? (stop.threadId === undefined ? undefined : this.threadsById.get(stop.threadId));
+    const snapshot = record?.state === "stopped" ? this.toThread(record) : undefined;
+    const thread = snapshot?.state === "stopped" ? snapshot : undefined;
+    return {
+      revision: stop.revision,
+      event: structuredClone(stop.body),
+      ...(thread ? { thread } : {}),
+    };
+  }
+
+  private stopForThread(thread: ThreadRecord): Stop {
+    if (thread.state !== "stopped" || thread.stopRevision === undefined || !thread.stop) {
+      throw new Error(`Thread ${thread.id} has no current stop.`);
+    }
+    return this.toStop(thread.stop, thread);
+  }
+
+  private countThreads(threads: readonly ThreadRecord[]): SessionSnapshot["threadCounts"] {
+    const byState: SessionSnapshot["threadCounts"]["byState"] = { unknown: 0, running: 0, stopped: 0 };
+    for (const thread of threads) {
+      switch (thread.state) {
+        case "unknown":
+        case "running":
+        case "stopped":
+          byState[thread.state]++;
+      }
+    }
+    return { total: threads.length, byState };
+  }
+
+  private compareThreads(a: ThreadRecord, b: ThreadRecord): number {
+    const triggerId = this.lastStop?.threadId;
+    const triggerOrder = Number(b.id === triggerId) - Number(a.id === triggerId);
+    if (triggerOrder !== 0) return triggerOrder;
+    const rank: Record<ThreadState, number> = { stopped: 0, running: 1, unknown: 2, exited: 3 };
+    return rank[a.state] - rank[b.state] || a.id - b.id;
+  }
+
   private async resolveFrame(
-    stop: StopContext,
+    stop: InspectionTarget,
     frameIndex: number,
     signal?: AbortSignal,
   ): Promise<DebugProtocol.StackFrame> {
@@ -939,7 +1008,7 @@ export class DebugSession {
     return frame;
   }
 
-  private assertStop(stop: StopContext): void {
+  private assertStop(stop: InspectionTarget): void {
     this.assertActive();
     const thread = this.threadsById.get(stop.threadId);
     if (thread?.state !== "stopped" || thread.stopRevision !== stop.revision) {
@@ -981,7 +1050,13 @@ export class DebugSession {
           if (thread.state !== "exited") this.setRunning(thread, revision);
         }
         this.pendingAllStop = undefined;
-        this.lastStop = undefined;
+        if (
+          body.allThreadsContinued !== false ||
+          this.lastStop?.threadId === undefined ||
+          this.lastStop.threadId === body.threadId
+        ) {
+          this.lastStop = undefined;
+        }
         this.notifyChange();
         break;
       }
@@ -1066,8 +1141,7 @@ export class DebugSession {
       this.pendingAllStop = stop;
       for (const thread of this.threadsById.values()) {
         if (thread.state === "exited") continue;
-        if (thread.state !== "stopped" || thread.id === body.threadId) this.setStopped(thread, revision, body);
-        else thread.lastChangedRevision = revision;
+        this.setStopped(thread, revision, stop);
       }
     } else if (body.threadId === undefined) {
       // An anonymous stop must prevent a late resume response from overriding newer evidence.
@@ -1075,17 +1149,17 @@ export class DebugSession {
     }
     if (body.threadId !== undefined) {
       const thread = this.getOrCreateThread(body.threadId);
-      this.setStopped(thread, revision, body);
+      this.setStopped(thread, revision, stop);
       this.lastStoppedThreadId = body.threadId;
     }
     this.notifyChange();
   }
 
-  private setStopped(thread: ThreadRecord, revision: number, body: DebugProtocol.StoppedEvent["body"]): void {
+  private setStopped(thread: ThreadRecord, revision: number, stop: StopEventRecord): void {
     thread.state = "stopped";
     thread.stopRevision = revision;
     thread.lastChangedRevision = revision;
-    thread.stop = body;
+    thread.stop = stop;
   }
 
   private setRunning(thread: ThreadRecord, revision: number): void {
@@ -1300,21 +1374,6 @@ export class DebugSession {
     ) {
       throw new DebugError("INVALID_ARGUMENT", "Page start must be non-negative and count must be from 1 to 100.");
     }
-  }
-
-  private threadSnapshot(thread: ThreadRecord): ThreadSnapshot {
-    return {
-      id: thread.id,
-      ...(thread.name !== undefined ? { name: thread.name } : {}),
-      state: thread.state,
-      ...(thread.state === "stopped" && thread.stopRevision !== undefined && thread.stop
-        ? { revision: thread.stopRevision, stop: structuredClone(thread.stop) }
-        : {}),
-    };
-  }
-
-  private stoppedThread(thread: ThreadRecord): StoppedThread {
-    return this.threadSnapshot(thread) as StoppedThread;
   }
 
   private page<T>(items: readonly T[], options: PageOptions): Page<T> {

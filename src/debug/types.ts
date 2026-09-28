@@ -1,6 +1,8 @@
 import type { DebugProtocol } from "@vscode/debugprotocol";
 import type { DebugConfiguration } from "../config/launch-config.js";
 
+// Session lifecycle
+
 /** Stable manager-assigned identity for one debug session. */
 export type DebugSessionId = string;
 
@@ -19,66 +21,60 @@ export interface DebuggeeExit {
   exitCode: number;
 }
 
-/** Execution state justified by the events and responses received so far. */
-export type ThreadState = "unknown" | "running" | "stopped" | "exited";
+// Execution control
 
-/** One thread; stop and revision are available only while it remains stopped. */
-export interface ThreadSnapshot {
-  id: number;
-  name?: string;
-  state: ThreadState;
-  stop?: DebugProtocol.StoppedEvent["body"];
+/** One active thread. A stopped thread's revision is the credential for inspecting its current suspended state. */
+export type Thread =
+  | { id: number; name?: string; state: "unknown" | "running" }
+  | { id: number; name?: string; state: "stopped"; revision: number };
+
+/** One observed stop and, when available, the thread selected for inspection. `event.threadId` identifies the trigger. */
+export interface Stop {
+  revision: number;
+  event: DebugProtocol.StoppedEvent["body"];
+  thread?: Extract<Thread, { state: "stopped" }>;
+}
+
+/** Select a thread and optionally require its current stop revision. */
+export interface ThreadSelection {
+  threadId?: number;
   revision?: number;
 }
 
-/** A current stopped thread with a usable inspection revision; its stop event may have been triggered by another thread when all threads stopped. */
-export type StoppedThread = ThreadSnapshot & {
-  state: "stopped";
-  revision: number;
-  stop: DebugProtocol.StoppedEvent["body"];
-};
+/** Supported execution commands, distinct from passive waiting. */
+export type ExecuteAction = "continue" | "next" | "step_in" | "step_out" | "pause";
 
-/** A detached snapshot of locally observed session state. */
-export interface SessionSnapshot {
-  configuration: Pick<DebugConfiguration, "name" | "type" | "request">;
-  capabilities: Pick<
-    DebugProtocol.Capabilities,
-    | "supportsSingleThreadExecutionRequests"
-    | "supportsConditionalBreakpoints"
-    | "supportsHitConditionalBreakpoints"
-    | "supportsLogPoints"
-    | "supportsFunctionBreakpoints"
-  >;
-  state: SessionState;
-  revision: number;
-  /** The foreground operation, or a detached execution request when no foreground operation is active. */
-  operation?: SessionOperation;
-  threads?: ThreadSnapshot[];
-  debuggeeExit?: DebuggeeExit;
+/** Execution selection and observation budget after the request succeeds. */
+export interface ExecuteOptions {
+  threadId?: number;
+  singleThread?: boolean;
+  waitMs: number;
 }
 
-/** A lightweight local view used to discover manager-owned sessions. */
-export interface DebugSessionSummary {
-  sessionId: DebugSessionId;
-  /** Present when this session was started by another adapter through `startDebugging`. */
-  parentSessionId?: DebugSessionId;
-  configuration?: Pick<DebugConfiguration, "name" | "type" | "request">;
-  state: SessionState["state"];
-  operation?: SessionOperation;
-  cleanupError?: string;
+/** Passive observation; revision excludes current stops at or below that value. */
+export interface WaitOptions extends ThreadSelection {
+  waitMs: number;
 }
 
-/** Starting a session returns its manager identity with the initial observations. */
-export interface StartSessionResult {
-  sessionId: DebugSessionId;
-  execution: ExecutionOutcome;
-  breakpoints: BreakpointsSnapshot;
+/** Public actions serialized when one session operation blocks another. */
+export type SessionOperationAction =
+  | ExecuteAction
+  | "set_breakpoints"
+  | "set_function_breakpoints"
+  | "wait"
+  | "threads"
+  | "stack_trace"
+  | "variables"
+  | "evaluate";
+
+/** A session operation visible to callers while it is in progress. */
+export interface SessionOperation {
+  action: SessionOperationAction;
+  /** UTC timestamp captured when the operation entered the session's concurrency gate. */
+  startedAt: string;
 }
 
-/** Closing waits at most five seconds and may leave cleanup in progress. */
-export type CloseSessionResult =
-  | { kind: "closing"; snapshot?: SessionSnapshot }
-  | { kind: "closed"; snapshot?: SessionSnapshot };
+// Breakpoints
 
 /** One breakpoint's position and optional conditions, with a one-based line number. */
 export interface SourceBreakpointSpec {
@@ -138,6 +134,51 @@ export interface BreakpointsSnapshot {
   exception?: ExceptionBreakpointsResult;
 }
 
+// Session results
+
+/** A detached snapshot of locally observed session state. */
+export interface SessionSnapshot {
+  configuration: Pick<DebugConfiguration, "name" | "type" | "request">;
+  capabilities: Pick<
+    DebugProtocol.Capabilities,
+    | "supportsSingleThreadExecutionRequests"
+    | "supportsConditionalBreakpoints"
+    | "supportsHitConditionalBreakpoints"
+    | "supportsLogPoints"
+    | "supportsFunctionBreakpoints"
+  >;
+  state: SessionState;
+  revision: number;
+  /** The foreground operation, or a detached execution request when no foreground operation is active. */
+  operation?: SessionOperation;
+  /** Latest stop; its thread is the trigger when that thread remains inspectable. */
+  stop?: Stop;
+  /** Bounded counts of active threads already observed locally. */
+  threadCounts: {
+    total: number;
+    byState: Record<Thread["state"], number>;
+  };
+  debuggeeExit?: DebuggeeExit;
+}
+
+/** A lightweight local view used to discover manager-owned sessions. */
+export interface DebugSessionSummary {
+  sessionId: DebugSessionId;
+  /** Present when this session was started by another adapter through `startDebugging`. */
+  parentSessionId?: DebugSessionId;
+  configuration?: Pick<DebugConfiguration, "name" | "type" | "request">;
+  state: SessionState["state"];
+  operation?: SessionOperation;
+  cleanupError?: string;
+}
+
+/** Normal outcomes of execution or observation, including an exhausted wait budget. */
+export type ExecutionOutcome =
+  | { kind: "stopped"; stop: Stop }
+  | { kind: "threadExited"; threadId: number }
+  | { kind: "timeout"; snapshot: SessionSnapshot }
+  | { kind: "closed"; snapshot: SessionSnapshot };
+
 export interface StartOptions {
   breakpoints: InitialBreakpoints;
   waitMs: number;
@@ -145,57 +186,30 @@ export interface StartOptions {
   deadline: number;
 }
 
-/** Select a thread and optionally require its current stop revision. */
-export interface ThreadSelection {
-  threadId?: number;
-  revision?: number;
+/** Starting a session returns its manager identity with the initial observations. */
+export interface StartSessionResult {
+  sessionId: DebugSessionId;
+  execution: ExecutionOutcome;
+  breakpoints: BreakpointsSnapshot;
 }
 
-/** Supported execution commands, distinct from passive waiting. */
-export type ExecuteAction = "continue" | "next" | "step_in" | "step_out" | "pause";
+/** Closing waits at most five seconds and may leave cleanup in progress. */
+export type CloseSessionResult =
+  | { kind: "closing"; snapshot?: SessionSnapshot }
+  | { kind: "closed"; snapshot?: SessionSnapshot };
 
-/** Public actions serialized when one session operation blocks another. */
-export type SessionOperationAction =
-  | ExecuteAction
-  | "set_breakpoints"
-  | "set_function_breakpoints"
-  | "wait"
-  | "threads"
-  | "stack_trace"
-  | "variables"
-  | "evaluate";
-
-/** A session operation visible to callers while it is in progress. */
-export interface SessionOperation {
-  action: SessionOperationAction;
-  /** UTC timestamp captured when the operation entered the session's concurrency gate. */
-  startedAt: string;
-}
-
-/** Execution selection and observation budget after the request succeeds. */
-export interface ExecuteOptions {
-  threadId?: number;
-  singleThread?: boolean;
-  waitMs: number;
-}
-
-/** Passive observation; revision excludes current stops at or below that value. */
-export interface WaitOptions extends ThreadSelection {
-  waitMs: number;
-}
-
-/** Normal outcomes of execution or observation, including an exhausted wait budget. Without a thread selection, a stop with a known trigger returns that thread. */
-export type ExecutionOutcome =
-  | { kind: "stopped"; thread: StoppedThread }
-  | { kind: "stopped"; revision: number; stop: DebugProtocol.StoppedEvent["body"] }
-  | { kind: "threadExited"; threadId: number }
-  | { kind: "timeout"; snapshot: SessionSnapshot }
-  | { kind: "closed"; snapshot: SessionSnapshot };
+// Pagination
 
 /** Zero-based pagination of one selected list. */
 export interface PageOptions {
   start: number;
   count: number;
+}
+
+/** Filters and pagination accepted by the `threads` operation. */
+export interface ThreadsOptions extends PageOptions {
+  state?: Thread["state"];
+  nameContains?: string;
 }
 
 /** Metadata for an already selected page; unknown totals are omitted. */
@@ -213,6 +227,8 @@ export interface OutputOptions extends PageOptions {
   category?: string;
 }
 
+// Inspection
+
 /** Select a zero-based stack position, not an adapter frame identifier. */
 export interface FrameSelection extends ThreadSelection {
   frameIndex: number;
@@ -223,14 +239,14 @@ export type VariablesSelection =
   | (FrameSelection & { scope: string; variablesReference?: never })
   | { threadId?: number; revision: number; variablesReference: number; frameIndex?: never; scope?: never };
 
-/** Stop credentials captured and checked throughout an inspection. */
-export interface StopContext {
+/** A thread and suspended-state revision selected for inspection. */
+export interface InspectionTarget {
   threadId: number;
   revision: number;
 }
 
-/** An original response body tied to the locally validated stop. */
-export type Inspection<T> = StopContext & { body: T };
+/** An original response body tied to the locally validated inspection target. */
+export type Inspection<T> = InspectionTarget & { body: T };
 
 /** A stack response containing only the selected page of complete frames. */
 export type StackResult = Inspection<DebugProtocol.StackTraceResponse["body"]> & { page: PageInfo };
